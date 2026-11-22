@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/siouxdb-vfs", "crates/siouxdb", "crates/siouxdb-cli"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/OrlGustavo33/siouxdb"
+authors = ["Sioux e contribuidores do SiouxDB"]
+description = "Banco de dados relacional embutido, num arquivo só: cifrado por padrão, verificável e com histórico consultável."
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+siouxdb-vfs = { path = "crates/siouxdb-vfs", version = "0.0.1" }
+siouxdb = { path = "crates/siouxdb", version = "0.0.1" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
