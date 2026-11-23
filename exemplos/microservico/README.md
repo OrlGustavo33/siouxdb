@@ -31,7 +31,19 @@ SIOUX_ENDERECO=127.0.0.1:7878 \
 
 Só **um processo** pode abrir o arquivo (o segundo recebe "em uso"). Ao receber SIGTERM/Ctrl+C ele termina as requisições, faz o checkpoint e sai.
 
-## Rotas
+## SQL
+
+```bash
+curl -H "$T" -H 'content-type: application/json' -X POST $U/sql -d '{
+  "sql": "SELECT cidade, COUNT(*) AS n FROM clientes WHERE saldo > ? GROUP BY cidade ORDER BY n DESC",
+  "params": [10]
+}'
+# {"lsn": 7, "resultados": [{"colunas": ["cidade","n"], "linhas": [["SP",2]], "afetadas": 0}]}
+```
+
+Vários comandos separados por `;` rodam numa transação só (tudo ou nada). Um SELECT sozinho roda numa foto do banco, sem esperar escritores.
+
+## Rotas REST
 
 ```bash
 T='Authorization: Bearer um-token-longo-e-aleatorio'; U=http://127.0.0.1:7878

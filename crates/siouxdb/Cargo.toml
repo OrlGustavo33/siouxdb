@@ -23,6 +23,7 @@ siouxdb-metricas.workspace = true
 siouxdb-transacoes.workspace = true
 siouxdb-indices.workspace = true
 siouxdb-catalogo.workspace = true
+siouxdb-sql.workspace = true
 
 [lints]
 workspace = true

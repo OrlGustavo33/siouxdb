@@ -56,6 +56,22 @@ pub struct DefTabela {
     pub chave: Vec<usize>,
     /// Página de cabeçalho da tabela.
     pub cabecalho: NumeroPagina,
+    /// Índices secundários.
+    pub indices: Vec<DefIndice>,
+}
+
+/// Um índice secundário: leva dos valores de algumas colunas à chave primária. Guarda o
+/// estado **atual** (não é versionado); leituras "como estava" usam a tabela.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefIndice {
+    /// Nome (único no banco).
+    pub nome: String,
+    /// Posições das colunas indexadas, na ordem.
+    pub colunas: Vec<usize>,
+    /// Recusa dois valores iguais (nulos não contam, como no SQL).
+    pub unico: bool,
+    /// Raiz da árvore do índice.
+    pub raiz: NumeroPagina,
 }
 
 /// Uma versão de uma linha, no histórico.
@@ -178,6 +194,9 @@ impl Tabela {
         let cab = Cab::ler(tx, self.def.cabecalho)?;
         arvore::liberar(tx, cab.raiz)?;
         log::liberar(tx, cab.pontas.primeira)?;
+        for i in &self.def.indices {
+            arvore::liberar(tx, i.raiz)?;
+        }
         tx.liberar(self.def.cabecalho)?;
         Ok(())
     }
@@ -248,9 +267,10 @@ impl Tabela {
         &self,
         tx: &mut P,
         chave: &[u8],
-        dados: &[u8],
+        linha: Option<&[Valor]>,
         modo: Modo,
     ) -> Resultado<bool> {
+        let dados = linha.map(codificar_linha).unwrap_or_default();
         let mut cab = Cab::ler(tx, self.def.cabecalho)?;
         let anterior = match arvore::obter_com(tx, cab.raiz, chave, Ponteiro::de_bytes)? {
             Some(p) => p?,
@@ -263,6 +283,26 @@ impl Tabela {
             _ => {}
         }
         let removendo = matches!(modo, Modo::Remover);
+        // Índices: a linha antiga sai, a nova entra. Único é conferido antes de gravar nada.
+        let antiga = if existia && !self.def.indices.is_empty() {
+            self.resolver(tx, anterior, u64::MAX)?
+        } else {
+            None
+        };
+        if let Some(nova) = linha {
+            for idx in self.def.indices.iter().filter(|i| i.unico) {
+                self.conferir_unico(tx, idx, nova, chave)?;
+            }
+        }
+        for idx in &self.def.indices {
+            if let Some(a) = &antiga {
+                arvore::remover(tx, idx.raiz, &chave_indice(idx, a, chave)?)?;
+            }
+            if let Some(nova) = linha {
+                arvore::inserir(tx, idx.raiz, &chave_indice(idx, nova, chave)?, chave)?;
+            }
+        }
+        let dados = dados.as_slice();
         let ponteiro = log::anexar(
             tx,
             &mut cab.pontas,
@@ -288,7 +328,7 @@ impl Tabela {
     pub fn inserir<P: PaginasMut + ?Sized>(&self, tx: &mut P, linha: &[Valor]) -> Resultado<()> {
         self.validar(linha)?;
         let chave = self.chave_da_linha(linha)?;
-        self.escrever(tx, &chave, &codificar_linha(linha), Modo::Inserir)
+        self.escrever(tx, &chave, Some(linha), Modo::Inserir)
             .map(|_| ())
     }
 
@@ -296,13 +336,93 @@ impl Tabela {
     pub fn gravar<P: PaginasMut + ?Sized>(&self, tx: &mut P, linha: &[Valor]) -> Resultado<bool> {
         self.validar(linha)?;
         let chave = self.chave_da_linha(linha)?;
-        self.escrever(tx, &chave, &codificar_linha(linha), Modo::Gravar)
+        self.escrever(tx, &chave, Some(linha), Modo::Gravar)
     }
 
     /// Remove a linha com essa chave primária. Devolve `true` se existia.
     pub fn remover<P: PaginasMut + ?Sized>(&self, tx: &mut P, chave: &[Valor]) -> Resultado<bool> {
         let chave = self.chave_dos_valores(chave)?;
-        self.escrever(tx, &chave, &[], Modo::Remover)
+        self.escrever(tx, &chave, None, Modo::Remover)
+    }
+
+    fn conferir_unico<P: Paginas + ?Sized>(
+        &self,
+        p: &P,
+        idx: &DefIndice,
+        linha: &[Valor],
+        chave: &[u8],
+    ) -> Resultado<()> {
+        let valores: Vec<Valor> = idx.colunas.iter().map(|&i| linha[i].clone()).collect();
+        if valores.iter().any(|v| matches!(v, Valor::Nulo)) {
+            return Ok(());
+        }
+        let prefixo = codificar_chave(&valores)?;
+        let fim = fim_do_prefixo(&prefixo);
+        let mut c = Cursor::novo(p, idx.raiz, Some(&prefixo), Some(&fim))?;
+        while let Some(outra) = c.proximo_com(|_, v| v != chave)? {
+            if outra {
+                return Err(ErroCatalogo::UnicoViolado(idx.nome.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Preenche um índice novo com as linhas atuais (usado ao criar índice em tabela com dados).
+    pub(crate) fn preencher_indice<P: PaginasMut + ?Sized>(
+        &self,
+        tx: &mut P,
+        idx: &DefIndice,
+    ) -> Resultado<()> {
+        let linhas = self.varrer(tx, None, None)?.todas()?;
+        for linha in linhas {
+            let chave = self.chave_da_linha(&linha)?;
+            if idx.unico {
+                self.conferir_unico(tx, idx, &linha, &chave)?;
+            }
+            arvore::inserir(tx, idx.raiz, &chave_indice(idx, &linha, &chave)?, &chave)?;
+        }
+        Ok(())
+    }
+
+    /// Chaves primárias (codificadas) cujas colunas do índice `posicao` estão entre `inicio`
+    /// e `fim` (bytes de [`codificar_chave`], `fim` exclusivo). Estado atual.
+    pub fn buscar_no_indice<P: Paginas + ?Sized>(
+        &self,
+        p: &P,
+        posicao: usize,
+        inicio: Option<&[u8]>,
+        fim: Option<&[u8]>,
+    ) -> Resultado<Vec<Vec<u8>>> {
+        let idx = self
+            .def
+            .indices
+            .get(posicao)
+            .ok_or(ErroCatalogo::Corrompido("índice inexistente"))?;
+        let mut c = Cursor::novo(p, idx.raiz, inicio, fim)?;
+        let mut v = Vec::new();
+        while let Some(pk) = c.proximo_com(|_, v| v.to_vec())? {
+            v.push(pk);
+        }
+        Ok(v)
+    }
+
+    /// Linha pela chave primária já codificada, como estava no LSN `lsn`.
+    pub fn obter_por_bytes<P: Paginas + ?Sized>(
+        &self,
+        p: &P,
+        chave: &[u8],
+        lsn: u64,
+    ) -> Resultado<Option<Vec<Valor>>> {
+        let cab = Cab::ler(p, self.def.cabecalho)?;
+        match arvore::obter_com(p, cab.raiz, chave, Ponteiro::de_bytes)? {
+            Some(pt) => self.resolver(p, pt?, lsn),
+            None => Ok(None),
+        }
+    }
+
+    /// Valores da chave primária de uma linha completa.
+    pub fn chave_de(&self, linha: &[Valor]) -> Vec<Valor> {
+        self.def.chave.iter().map(|&i| linha[i].clone()).collect()
     }
 
     /// Linha na versão que valia no LSN `ate` (`u64::MAX` = a mais nova).
@@ -417,6 +537,24 @@ impl Tabela {
         let inicio = inicio.map(codificar_chave).transpose()?;
         let fim = fim.map(codificar_chave).transpose()?;
         let cursor = Cursor::novo(p, cab.raiz, inicio.as_deref(), fim.as_deref())?;
+        Ok(Varredura {
+            tabela: self,
+            paginas: p,
+            cursor,
+            lsn,
+        })
+    }
+
+    /// Como [`Tabela::varrer_em`], com limites já codificados (`fim` exclusivo).
+    pub fn varrer_bytes<'p, P: Paginas + ?Sized>(
+        &'p self,
+        p: &'p P,
+        inicio: Option<&[u8]>,
+        fim: Option<&[u8]>,
+        lsn: u64,
+    ) -> Resultado<Varredura<'p, P>> {
+        let cab = Cab::ler(p, self.def.cabecalho)?;
+        let cursor = Cursor::novo(p, cab.raiz, inicio, fim)?;
         Ok(Varredura {
             tabela: self,
             paginas: p,
@@ -553,4 +691,20 @@ impl<P: Paginas + ?Sized> Varredura<'_, P> {
         }
         Ok(v)
     }
+}
+
+/// Chave de uma entrada de índice: valores indexados + chave primária (para nunca repetir).
+fn chave_indice(idx: &DefIndice, linha: &[Valor], chave: &[u8]) -> Resultado<Vec<u8>> {
+    let valores: Vec<Valor> = idx.colunas.iter().map(|&i| linha[i].clone()).collect();
+    let mut k = codificar_chave(&valores)?;
+    k.extend_from_slice(chave);
+    Ok(k)
+}
+
+/// Menor sequência de bytes maior que todas as que começam com `prefixo` (para varrer um
+/// prefixo de chave composta: nenhuma codificação de valor começa com 0xFF).
+pub fn fim_do_prefixo(prefixo: &[u8]) -> Vec<u8> {
+    let mut f = prefixo.to_vec();
+    f.push(0xFF);
+    f
 }

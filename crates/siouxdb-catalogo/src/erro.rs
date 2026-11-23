@@ -24,6 +24,12 @@ pub enum ErroCatalogo {
     LinhaInvalida(String),
     /// Já existe linha com essa chave primária.
     ChaveDuplicada,
+    /// O valor repete outro num índice único (nome do índice).
+    UnicoViolado(String),
+    /// Não existe índice com esse nome.
+    IndiceNaoExiste(String),
+    /// Já existe índice com esse nome.
+    IndiceJaExiste(String),
     /// A linha (com a chave) não cabe numa página. Valores grandes fora da página ainda não
     /// existem.
     LinhaGrandeDemais {
@@ -46,6 +52,9 @@ impl fmt::Display for ErroCatalogo {
             ErroCatalogo::NomeInvalido(m) => write!(f, "nome inválido: {m}"),
             ErroCatalogo::DefinicaoInvalida(m) => write!(f, "definição de tabela inválida: {m}"),
             ErroCatalogo::LinhaInvalida(m) => write!(f, "linha inválida: {m}"),
+            ErroCatalogo::UnicoViolado(i) => write!(f, "valor repetido no índice único \"{i}\""),
+            ErroCatalogo::IndiceNaoExiste(i) => write!(f, "o índice \"{i}\" não existe"),
+            ErroCatalogo::IndiceJaExiste(i) => write!(f, "o índice \"{i}\" já existe"),
             ErroCatalogo::ChaveDuplicada => {
                 write!(f, "já existe uma linha com essa chave primária")
             }

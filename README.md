@@ -85,7 +85,8 @@ Só o motor é obrigatório; o resto é opcional. Embutido (como o SQLite) ou se
 - `siouxdb-indices`: **árvore B+** em páginas (chaves de tamanho variável, separadora curta, cursor por faixa, verificador de estrutura), testada contra o `BTreeMap` do Rust com milhares de operações aleatórias;
 - `siouxdb-catalogo`: **tabelas versionadas** — a camada quente é um livro-razão onde toda gravação anexa uma versão; índice da chave primária; histórico por linha e leitura **como estava no LSN tal**; catálogo com `sys_tabelas` e `sys_colunas`;
 - **valores grandes** (linha de até 16 MiB, em páginas de transbordo), **compactação** do histórico e **backup a quente**;
-- comando `sioux criar | info | verificar | trocar-senha | checkpoint | tabelas | backup | compactar`.
+- **índices secundários** (inclusive `UNIQUE`) e **SQL** (`siouxdb-sql`): `CREATE/DROP TABLE|INDEX`, `INSERT` com conflito, `SELECT` com `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`AS OF`, `UPDATE`, `DELETE`, `EXPLAIN`, parâmetros `?`/`$1`;
+- comando `sioux criar | info | verificar | trocar-senha | checkpoint | tabelas | sql | backup | compactar`.
 - `siouxdb-metricas`: histograma sem trava, séries de 60 s e alertas configuráveis;
 - **SiouxDB Studio** (`studio/`, Tauri): painel de monitoramento em tempo real sobre um arquivo ou uma demonstração com carga gerada.
 
@@ -114,7 +115,22 @@ Na sincronia Total o limite é o `fsync` do disco; a confirmação em grupo é o
 
 ## Usar hoje (embutido)
 
-Ainda não há SQL, mas dá para usar o SiouxDB num programa Rust pela API de tabelas (`siouxdb::abrir_ou_criar` + `siouxdb::catalogo`). O exemplo [`exemplos/microservico`](exemplos/microservico) é uma API HTTP/JSON completa (tabelas, inserir/gravar/remover, faixa, histórico e leitura por LSN) com token obrigatório.
+```sql
+CREATE TABLE clientes (id INTEIRO PRIMARY KEY, nome TEXTO NOT NULL, cidade TEXTO, saldo REAL);
+CREATE INDEX clientes_cidade ON clientes (cidade);
+INSERT INTO clientes VALUES (1, 'ANA', 'SP', 10.5), (2, 'BIA', 'RJ', 0) ON CONFLICT DO NOTHING;
+SELECT cidade, COUNT(*), SUM(saldo) FROM clientes WHERE saldo >= ? GROUP BY cidade ORDER BY 2 DESC LIMIT 10;
+UPDATE clientes SET saldo = saldo + 1 WHERE cidade = 'SP';
+SELECT * FROM clientes AS OF 3 WHERE id = 1;   -- como estava na confirmação 3
+EXPLAIN SELECT * FROM clientes WHERE cidade = 'SP';   -- "índice clientes_cidade"
+SELECT * FROM sys_tabelas;   -- e sys_colunas, sys_indices
+```
+
+- Em Rust: `siouxdb::abrir_ou_criar` + `siouxdb::sql::executar` (dentro de uma transação) / `siouxdb::sql::consultar` (numa leitura).
+- Pela linha de comando: `sioux sql banco.sdb "SELECT ..."`.
+- Por HTTP: o exemplo [`exemplos/microservico`](exemplos/microservico) (`POST /sql` e rotas REST), com token obrigatório.
+
+O SQL é um subconjunto (uma tabela por consulta, sem JOIN nem subconsulta por enquanto). O planejador usa a chave primária ou um índice quando o `WHERE` tem `coluna = valor` ou faixas; um teste diferencial compara 1.500 consultas aleatórias com o mesmo filtro calculado fora do banco.
 
 ## Compilar e testar
 

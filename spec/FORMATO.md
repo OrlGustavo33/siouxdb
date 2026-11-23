@@ -139,6 +139,9 @@ Quando chave + linha passam de metade do espaço de um registro, a linha vai par
 ### Compactação
 Reescreve o log de uma tabela guardando, por chave, as versões posteriores ao LSN de corte e a que valia nele; chaves removidas até o corte saem do índice. O log antigo e os transbordos voltam para a lista de livres.
 
+### Índices secundários
+Árvore B+ por índice; chave = valores das colunas indexadas (codificação de chave) + chave primária codificada; valor = chave primária codificada. Guarda só o estado atual (não é versionado): consultas `AS OF` usam a tabela. A lista de índices (nome, único, raiz, colunas) fica na definição da tabela no catálogo.
+
 ### Tabela e catálogo
 - Cabeçalho de tabela: raiz do índice, primeira e última página do log, versões, linhas (5 × u64).
 - O índice da chave primária leva à versão mais nova; remoção também é versão (o histórico continua alcançável).

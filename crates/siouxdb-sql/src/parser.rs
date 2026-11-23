@@ -1,0 +1,757 @@
+//! Parser (descida recursiva) do subconjunto de SQL do SiouxDB.
+
+use crate::lexico::{Ficha, Tok, fichas};
+use crate::{ErroSql, Resultado};
+use siouxdb_catalogo::{Tipo, Valor};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Op {
+    Igual,
+    Diferente,
+    Menor,
+    MenorIgual,
+    Maior,
+    MaiorIgual,
+    E,
+    Ou,
+    Mais,
+    Menos,
+    Vezes,
+    Dividir,
+    Resto,
+    Concatenar,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Expr {
+    Valor(Valor),
+    Coluna(String),
+    Param(usize),
+    Nao(Box<Expr>),
+    Negativo(Box<Expr>),
+    Bin(Op, Box<Expr>, Box<Expr>),
+    EhNulo(Box<Expr>, bool),
+    Em(Box<Expr>, Vec<Expr>, bool),
+    Entre(Box<Expr>, Box<Expr>, Box<Expr>, bool),
+    Como(Box<Expr>, Box<Expr>, bool),
+    /// Nome em minúsculas, argumentos, `COUNT(*)`.
+    Funcao(String, Vec<Expr>, bool),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Item {
+    Tudo,
+    Expr(Expr, Option<String>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Selecao {
+    pub itens: Vec<Item>,
+    pub tabela: Option<String>,
+    pub como_estava: Option<Expr>,
+    pub onde: Option<Expr>,
+    pub agrupar: Vec<Expr>,
+    pub tendo: Option<Expr>,
+    pub ordem: Vec<(Expr, bool)>,
+    pub limite: Option<Expr>,
+    pub deslocamento: Option<Expr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Conflito {
+    Erro,
+    Ignorar,
+    Substituir,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Comando {
+    CriarTabela {
+        nome: String,
+        se_nao_existe: bool,
+        colunas: Vec<(String, Tipo, bool)>,
+        chave: Vec<String>,
+    },
+    ApagarTabela {
+        nome: String,
+        se_existe: bool,
+    },
+    CriarIndice {
+        nome: String,
+        tabela: String,
+        colunas: Vec<String>,
+        unico: bool,
+        se_nao_existe: bool,
+    },
+    ApagarIndice {
+        nome: String,
+        se_existe: bool,
+    },
+    Inserir {
+        tabela: String,
+        colunas: Option<Vec<String>>,
+        linhas: Vec<Vec<Expr>>,
+        conflito: Conflito,
+    },
+    Selecionar(Selecao),
+    Explicar(Selecao),
+    Atualizar {
+        tabela: String,
+        mudancas: Vec<(String, Expr)>,
+        onde: Option<Expr>,
+    },
+    Remover {
+        tabela: String,
+        onde: Option<Expr>,
+    },
+}
+
+impl Comando {
+    pub fn so_leitura(&self) -> bool {
+        matches!(self, Comando::Selecionar(_) | Comando::Explicar(_))
+    }
+}
+
+struct Parser {
+    f: Vec<Ficha>,
+    i: usize,
+    proximo_param: usize,
+}
+
+/// Lê um ou mais comandos separados por `;`.
+pub(crate) fn analisar(sql: &str) -> Resultado<Vec<Comando>> {
+    let mut p = Parser {
+        f: fichas(sql)?,
+        i: 0,
+        proximo_param: 0,
+    };
+    let mut v = Vec::new();
+    loop {
+        while p.simbolo(";") {}
+        if p.tok() == &Tok::Fim {
+            break;
+        }
+        v.push(p.comando()?);
+        if !p.simbolo(";") && p.tok() != &Tok::Fim {
+            return p.erro("esperava ; ou o fim do comando");
+        }
+    }
+    if v.is_empty() {
+        return p.erro("nenhum comando");
+    }
+    Ok(v)
+}
+
+impl Parser {
+    fn tok(&self) -> &Tok {
+        &self.f[self.i].tok
+    }
+
+    fn erro<T>(&self, m: &str) -> Resultado<T> {
+        let achou = match self.tok() {
+            Tok::Nome { texto, .. } => format!(" (achou \"{texto}\")"),
+            Tok::Simbolo(s) => format!(" (achou \"{s}\")"),
+            Tok::Fim => " (achou o fim)".into(),
+            _ => String::new(),
+        };
+        Err(ErroSql::Sintaxe {
+            posicao: self.f[self.i].pos,
+            mensagem: format!("{m}{achou}"),
+        })
+    }
+
+    fn avancar(&mut self) {
+        if self.i + 1 < self.f.len() {
+            self.i += 1;
+        }
+    }
+
+    /// Consome a palavra-chave se for a próxima.
+    fn chave(&mut self, k: &str) -> bool {
+        if matches!(self.tok(), Tok::Nome { texto, citado: false } if texto == k) {
+            self.avancar();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn espera_chave(&mut self, k: &str) -> Resultado<()> {
+        if self.chave(k) {
+            Ok(())
+        } else {
+            self.erro(&format!("esperava {}", k.to_uppercase()))
+        }
+    }
+
+    fn eh_chave(&self, k: &str) -> bool {
+        matches!(self.tok(), Tok::Nome { texto, citado: false } if texto == k)
+    }
+
+    fn simbolo(&mut self, s: &str) -> bool {
+        if matches!(self.tok(), Tok::Simbolo(x) if *x == s) {
+            self.avancar();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn espera(&mut self, s: &str) -> Resultado<()> {
+        if self.simbolo(s) {
+            Ok(())
+        } else {
+            self.erro(&format!("esperava \"{s}\""))
+        }
+    }
+
+    fn nome(&mut self) -> Resultado<String> {
+        match self.tok().clone() {
+            Tok::Nome { texto, citado } => {
+                if !citado && RESERVADAS.contains(&texto.as_str()) {
+                    return self.erro("esperava um nome");
+                }
+                self.avancar();
+                Ok(texto)
+            }
+            _ => self.erro("esperava um nome"),
+        }
+    }
+
+    fn lista_nomes(&mut self) -> Resultado<Vec<String>> {
+        self.espera("(")?;
+        let mut v = vec![self.nome()?];
+        while self.simbolo(",") {
+            v.push(self.nome()?);
+        }
+        self.espera(")")?;
+        Ok(v)
+    }
+
+    fn comando(&mut self) -> Resultado<Comando> {
+        if self.chave("create") {
+            let unico = self.chave("unique");
+            if self.chave("index") {
+                let se_nao_existe = self.se_nao_existe()?;
+                let nome = self.nome()?;
+                self.espera_chave("on")?;
+                let tabela = self.nome()?;
+                let colunas = self.lista_nomes()?;
+                return Ok(Comando::CriarIndice {
+                    nome,
+                    tabela,
+                    colunas,
+                    unico,
+                    se_nao_existe,
+                });
+            }
+            if unico {
+                return self.erro("esperava INDEX");
+            }
+            self.espera_chave("table")?;
+            return self.criar_tabela();
+        }
+        if self.chave("drop") {
+            let tabela = if self.chave("table") {
+                true
+            } else if self.chave("index") {
+                false
+            } else {
+                return self.erro("esperava TABLE ou INDEX");
+            };
+            let se_existe = if self.chave("if") {
+                self.espera_chave("exists")?;
+                true
+            } else {
+                false
+            };
+            let nome = self.nome()?;
+            return Ok(if tabela {
+                Comando::ApagarTabela { nome, se_existe }
+            } else {
+                Comando::ApagarIndice { nome, se_existe }
+            });
+        }
+        if self.eh_chave("insert") || self.eh_chave("replace") {
+            return self.inserir();
+        }
+        if self.chave("explain") {
+            self.espera_chave("select")?;
+            return Ok(Comando::Explicar(self.selecao()?));
+        }
+        if self.chave("select") {
+            return Ok(Comando::Selecionar(self.selecao()?));
+        }
+        if self.chave("update") {
+            let tabela = self.nome()?;
+            self.espera_chave("set")?;
+            let mut mudancas = Vec::new();
+            loop {
+                let c = self.nome()?;
+                self.espera("=")?;
+                mudancas.push((c, self.expr()?));
+                if !self.simbolo(",") {
+                    break;
+                }
+            }
+            let onde = if self.chave("where") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            return Ok(Comando::Atualizar {
+                tabela,
+                mudancas,
+                onde,
+            });
+        }
+        if self.chave("delete") {
+            self.espera_chave("from")?;
+            let tabela = self.nome()?;
+            let onde = if self.chave("where") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            return Ok(Comando::Remover { tabela, onde });
+        }
+        self.erro(
+            "comando desconhecido (use CREATE, DROP, INSERT, SELECT, UPDATE, DELETE ou EXPLAIN)",
+        )
+    }
+
+    fn se_nao_existe(&mut self) -> Resultado<bool> {
+        if self.chave("if") {
+            self.espera_chave("not")?;
+            self.espera_chave("exists")?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn tipo(&mut self) -> Resultado<Tipo> {
+        let Tok::Nome { texto, .. } = self.tok().clone() else {
+            return self.erro("esperava o tipo da coluna");
+        };
+        let t = match texto.as_str() {
+            "inteiro" | "int" | "integer" | "bigint" | "smallint" | "int8" | "int4" => {
+                Tipo::Inteiro
+            }
+            "real" | "float" | "double" | "numeric" | "decimal" | "float8" => Tipo::Real,
+            "texto" | "text" | "varchar" | "char" | "string" => Tipo::Texto,
+            "bytes" | "blob" | "bytea" => Tipo::Bytes,
+            "booleano" | "bool" | "boolean" => Tipo::Booleano,
+            _ => return self.erro("tipo desconhecido (INTEIRO, REAL, TEXTO, BYTES ou BOOLEANO)"),
+        };
+        self.avancar();
+        self.chave("precision");
+        if self.simbolo("(") {
+            // VARCHAR(100), NUMERIC(10,2): o tamanho é aceito e ignorado.
+            while !self.simbolo(")") {
+                if self.tok() == &Tok::Fim {
+                    return self.erro("esperava \")\"");
+                }
+                self.avancar();
+            }
+        }
+        Ok(t)
+    }
+
+    fn criar_tabela(&mut self) -> Resultado<Comando> {
+        let se_nao_existe = self.se_nao_existe()?;
+        let nome = self.nome()?;
+        self.espera("(")?;
+        let (mut colunas, mut chave) = (Vec::new(), Vec::new());
+        loop {
+            if self.chave("primary") {
+                self.espera_chave("key")?;
+                if !chave.is_empty() {
+                    return self.erro("PRIMARY KEY repetida");
+                }
+                chave = self.lista_nomes()?;
+            } else {
+                let c = self.nome()?;
+                let t = self.tipo()?;
+                let mut nao_nulo = false;
+                loop {
+                    if self.chave("not") {
+                        self.espera_chave("null")?;
+                        nao_nulo = true;
+                    } else if self.chave("null") {
+                    } else if self.chave("primary") {
+                        self.espera_chave("key")?;
+                        if !chave.is_empty() {
+                            return self.erro("PRIMARY KEY repetida");
+                        }
+                        chave = vec![c.clone()];
+                    } else {
+                        break;
+                    }
+                }
+                colunas.push((c, t, nao_nulo));
+            }
+            if !self.simbolo(",") {
+                break;
+            }
+        }
+        self.espera(")")?;
+        if chave.is_empty() {
+            return self.erro("a tabela precisa de PRIMARY KEY");
+        }
+        Ok(Comando::CriarTabela {
+            nome,
+            se_nao_existe,
+            colunas,
+            chave,
+        })
+    }
+
+    fn inserir(&mut self) -> Resultado<Comando> {
+        let mut conflito = Conflito::Erro;
+        if self.chave("replace") {
+            conflito = Conflito::Substituir;
+        } else {
+            self.espera_chave("insert")?;
+            if self.chave("or") {
+                conflito = if self.chave("replace") {
+                    Conflito::Substituir
+                } else if self.chave("ignore") {
+                    Conflito::Ignorar
+                } else {
+                    return self.erro("esperava REPLACE ou IGNORE");
+                };
+            }
+        }
+        self.espera_chave("into")?;
+        let tabela = self.nome()?;
+        let colunas = if matches!(self.tok(), Tok::Simbolo("(")) {
+            Some(self.lista_nomes()?)
+        } else {
+            None
+        };
+        self.espera_chave("values")?;
+        let mut linhas = Vec::new();
+        loop {
+            self.espera("(")?;
+            let mut l = vec![self.expr()?];
+            while self.simbolo(",") {
+                l.push(self.expr()?);
+            }
+            self.espera(")")?;
+            linhas.push(l);
+            if !self.simbolo(",") {
+                break;
+            }
+        }
+        if self.chave("on") {
+            self.espera_chave("conflict")?;
+            self.espera_chave("do")?;
+            conflito = if self.chave("nothing") {
+                Conflito::Ignorar
+            } else if self.chave("update") {
+                // ON CONFLICT DO UPDATE: substitui a linha inteira pelos valores novos.
+                Conflito::Substituir
+            } else {
+                return self.erro("esperava NOTHING ou UPDATE");
+            };
+        }
+        Ok(Comando::Inserir {
+            tabela,
+            colunas,
+            linhas,
+            conflito,
+        })
+    }
+
+    fn selecao(&mut self) -> Resultado<Selecao> {
+        let mut itens = Vec::new();
+        loop {
+            if self.simbolo("*") {
+                itens.push(Item::Tudo);
+            } else {
+                let e = self.expr()?;
+                // Apelido com AS, ou direto (`SELECT x total`) se o nome não for reservado.
+                let tem_as = self.chave("as");
+                let nome_livre = matches!(self.tok(), Tok::Nome { texto, citado } if *citado || !RESERVADAS.contains(&texto.as_str()));
+                let apelido = if tem_as || nome_livre {
+                    Some(self.nome()?)
+                } else {
+                    None
+                };
+                itens.push(Item::Expr(e, apelido));
+            }
+            if !self.simbolo(",") {
+                break;
+            }
+        }
+        let mut s = Selecao {
+            itens,
+            tabela: None,
+            como_estava: None,
+            onde: None,
+            agrupar: Vec::new(),
+            tendo: None,
+            ordem: Vec::new(),
+            limite: None,
+            deslocamento: None,
+        };
+        if self.chave("from") {
+            s.tabela = Some(self.nome()?);
+            if self.chave("as") {
+                self.espera_chave("of")?;
+                s.como_estava = Some(self.expr()?);
+            }
+        }
+        if self.chave("where") {
+            s.onde = Some(self.expr()?);
+        }
+        if self.chave("group") {
+            self.espera_chave("by")?;
+            loop {
+                s.agrupar.push(self.expr()?);
+                if !self.simbolo(",") {
+                    break;
+                }
+            }
+        }
+        if self.chave("having") {
+            s.tendo = Some(self.expr()?);
+        }
+        if self.chave("order") {
+            self.espera_chave("by")?;
+            loop {
+                let e = self.expr()?;
+                let desc = if self.chave("desc") {
+                    true
+                } else {
+                    self.chave("asc");
+                    false
+                };
+                s.ordem.push((e, desc));
+                if !self.simbolo(",") {
+                    break;
+                }
+            }
+        }
+        if self.chave("limit") {
+            s.limite = Some(self.expr()?);
+        }
+        if self.chave("offset") {
+            s.deslocamento = Some(self.expr()?);
+        }
+        Ok(s)
+    }
+
+    // Precedência: OR < AND < NOT < comparação < || < + - < * / % < unário.
+    fn expr(&mut self) -> Resultado<Expr> {
+        let mut e = self.e()?;
+        while self.chave("or") {
+            e = Expr::Bin(Op::Ou, Box::new(e), Box::new(self.e()?));
+        }
+        Ok(e)
+    }
+
+    fn e(&mut self) -> Resultado<Expr> {
+        let mut e = self.nao()?;
+        while self.chave("and") {
+            e = Expr::Bin(Op::E, Box::new(e), Box::new(self.nao()?));
+        }
+        Ok(e)
+    }
+
+    fn nao(&mut self) -> Resultado<Expr> {
+        if self.chave("not") {
+            return Ok(Expr::Nao(Box::new(self.nao()?)));
+        }
+        self.comparacao()
+    }
+
+    fn comparacao(&mut self) -> Resultado<Expr> {
+        let a = self.concatenacao()?;
+        let op = match self.tok() {
+            Tok::Simbolo("=") => Some(Op::Igual),
+            Tok::Simbolo("<>") | Tok::Simbolo("!=") => Some(Op::Diferente),
+            Tok::Simbolo("<") => Some(Op::Menor),
+            Tok::Simbolo("<=") => Some(Op::MenorIgual),
+            Tok::Simbolo(">") => Some(Op::Maior),
+            Tok::Simbolo(">=") => Some(Op::MaiorIgual),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.avancar();
+            return Ok(Expr::Bin(op, Box::new(a), Box::new(self.concatenacao()?)));
+        }
+        if self.chave("is") {
+            let negado = self.chave("not");
+            self.espera_chave("null")?;
+            return Ok(Expr::EhNulo(Box::new(a), negado));
+        }
+        let negado = self.chave("not");
+        if self.chave("in") {
+            self.espera("(")?;
+            let mut l = vec![self.expr()?];
+            while self.simbolo(",") {
+                l.push(self.expr()?);
+            }
+            self.espera(")")?;
+            return Ok(Expr::Em(Box::new(a), l, negado));
+        }
+        if self.chave("between") {
+            let de = self.concatenacao()?;
+            self.espera_chave("and")?;
+            let ate = self.concatenacao()?;
+            return Ok(Expr::Entre(
+                Box::new(a),
+                Box::new(de),
+                Box::new(ate),
+                negado,
+            ));
+        }
+        if self.chave("like") {
+            return Ok(Expr::Como(
+                Box::new(a),
+                Box::new(self.concatenacao()?),
+                negado,
+            ));
+        }
+        if negado {
+            return self.erro("esperava IN, BETWEEN ou LIKE depois de NOT");
+        }
+        Ok(a)
+    }
+
+    fn concatenacao(&mut self) -> Resultado<Expr> {
+        let mut e = self.soma()?;
+        while self.simbolo("||") {
+            e = Expr::Bin(Op::Concatenar, Box::new(e), Box::new(self.soma()?));
+        }
+        Ok(e)
+    }
+
+    fn soma(&mut self) -> Resultado<Expr> {
+        let mut e = self.produto()?;
+        loop {
+            let op = if self.simbolo("+") {
+                Op::Mais
+            } else if self.simbolo("-") {
+                Op::Menos
+            } else {
+                return Ok(e);
+            };
+            e = Expr::Bin(op, Box::new(e), Box::new(self.produto()?));
+        }
+    }
+
+    fn produto(&mut self) -> Resultado<Expr> {
+        let mut e = self.unario()?;
+        loop {
+            let op = if self.simbolo("*") {
+                Op::Vezes
+            } else if self.simbolo("/") {
+                Op::Dividir
+            } else if self.simbolo("%") {
+                Op::Resto
+            } else {
+                return Ok(e);
+            };
+            e = Expr::Bin(op, Box::new(e), Box::new(self.unario()?));
+        }
+    }
+
+    fn unario(&mut self) -> Resultado<Expr> {
+        if self.simbolo("-") {
+            return Ok(match self.unario()? {
+                Expr::Valor(Valor::Inteiro(i)) => Expr::Valor(Valor::Inteiro(-i)),
+                Expr::Valor(Valor::Real(r)) => Expr::Valor(Valor::Real(-r)),
+                e => Expr::Negativo(Box::new(e)),
+            });
+        }
+        if self.simbolo("+") {
+            return self.unario();
+        }
+        self.primario()
+    }
+
+    fn primario(&mut self) -> Resultado<Expr> {
+        match self.tok().clone() {
+            Tok::Inteiro(i) => {
+                self.avancar();
+                Ok(Expr::Valor(Valor::Inteiro(i)))
+            }
+            Tok::Real(r) => {
+                self.avancar();
+                Ok(Expr::Valor(Valor::Real(r)))
+            }
+            Tok::Texto(t) => {
+                self.avancar();
+                Ok(Expr::Valor(Valor::Texto(t)))
+            }
+            Tok::Param(n) => {
+                self.avancar();
+                let n = match n {
+                    Some(n) => n - 1,
+                    None => {
+                        self.proximo_param += 1;
+                        self.proximo_param - 1
+                    }
+                };
+                Ok(Expr::Param(n))
+            }
+            Tok::Simbolo("(") => {
+                self.avancar();
+                let e = self.expr()?;
+                self.espera(")")?;
+                Ok(e)
+            }
+            Tok::Nome { texto, citado } => {
+                if !citado {
+                    match texto.as_str() {
+                        "null" => {
+                            self.avancar();
+                            return Ok(Expr::Valor(Valor::Nulo));
+                        }
+                        "true" | "verdadeiro" => {
+                            self.avancar();
+                            return Ok(Expr::Valor(Valor::Booleano(true)));
+                        }
+                        "false" | "falso" => {
+                            self.avancar();
+                            return Ok(Expr::Valor(Valor::Booleano(false)));
+                        }
+                        _ => {}
+                    }
+                }
+                let nome = self.nome()?;
+                if self.simbolo("(") {
+                    if self.simbolo("*") {
+                        self.espera(")")?;
+                        return Ok(Expr::Funcao(nome, Vec::new(), true));
+                    }
+                    let mut args = Vec::new();
+                    if !self.simbolo(")") {
+                        args.push(self.expr()?);
+                        while self.simbolo(",") {
+                            args.push(self.expr()?);
+                        }
+                        self.espera(")")?;
+                    }
+                    return Ok(Expr::Funcao(nome, args, false));
+                }
+                // tabela.coluna: o prefixo da tabela é aceito e ignorado (uma tabela por consulta).
+                if self.simbolo(".") {
+                    return Ok(Expr::Coluna(self.nome()?));
+                }
+                Ok(Expr::Coluna(nome))
+            }
+            _ => self.erro("esperava um valor, coluna ou expressão"),
+        }
+    }
+}
+
+/// Palavras que não podem ser nome sem aspas.
+const RESERVADAS: [&str; 41] = [
+    "select", "from", "where", "and", "or", "not", "insert", "into", "values", "update", "set",
+    "delete", "create", "drop", "table", "index", "on", "primary", "key", "null", "is", "in",
+    "between", "like", "order", "by", "group", "having", "limit", "offset", "as", "asc", "desc",
+    "unique", "true", "false", "if", "exists", "conflict", "do", "explain",
+];

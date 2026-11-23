@@ -8,6 +8,7 @@
 //! sioux trocar-senha <arquivo>
 //! sioux checkpoint <arquivo>
 //! sioux tabelas <arquivo>
+//! sioux sql <arquivo> "<comandos>"
 //! sioux backup <arquivo> <destino>
 //! sioux compactar <arquivo> <tabela> [manter_desde_lsn]
 //! ```
@@ -42,6 +43,7 @@ fn main() -> ExitCode {
         ["trocar-senha", arquivo] => trocar_senha(arquivo),
         ["checkpoint", arquivo] => checkpoint(arquivo),
         ["tabelas", arquivo] => tabelas(arquivo),
+        ["sql", arquivo, comando] => sql(arquivo, comando),
         ["backup", arquivo, destino] => backup(arquivo, destino),
         ["compactar", arquivo, tabela, resto @ ..] => compactar(arquivo, tabela, resto),
         _ => {
@@ -333,5 +335,68 @@ fn compactar(arquivo: &str, tabela: &str, resto: &[&str]) -> Result<(), String> 
         "versões: {} → {} ({} chave(s) removida(s) saíram de vez)",
         r.versoes_antes, r.versoes_depois, r.chaves_apagadas
     );
+    Ok(())
+}
+
+fn texto_valor(v: &siouxdb::catalogo::Valor) -> String {
+    use siouxdb::catalogo::Valor;
+    match v {
+        Valor::Nulo => "NULL".into(),
+        Valor::Inteiro(i) => i.to_string(),
+        Valor::Real(r) => r.to_string(),
+        Valor::Texto(t) => t.clone(),
+        Valor::Bytes(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+        Valor::Booleano(b) => b.to_string(),
+    }
+}
+
+fn sql(arquivo: &str, comando: &str) -> Result<(), String> {
+    let b = abrir(arquivo)?;
+    let mut tx = b.escrever().map_err(|e| e.to_string())?;
+    let saidas = siouxdb::sql::executar(&mut tx, comando, &[]).map_err(|e| e.to_string())?;
+    let lsn = tx.confirmar().map_err(|e| e.to_string())?;
+    for s in saidas {
+        if s.colunas.is_empty() {
+            println!("{} linha(s) afetada(s)", s.afetadas);
+            continue;
+        }
+        let texto: Vec<Vec<String>> = s
+            .linhas
+            .iter()
+            .map(|l| l.iter().map(texto_valor).collect())
+            .collect();
+        let larguras: Vec<usize> = (0..s.colunas.len())
+            .map(|i| {
+                texto
+                    .iter()
+                    .map(|l| l[i].chars().count())
+                    .chain([s.colunas[i].chars().count()])
+                    .max()
+                    .unwrap_or(0)
+                    .min(60)
+            })
+            .collect();
+        let linha = |v: &[String]| {
+            v.iter()
+                .zip(&larguras)
+                .map(|(x, w)| format!("{:<w$}", x.chars().take(60).collect::<String>(), w = *w))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        println!("{}", linha(&s.colunas));
+        println!(
+            "{}",
+            larguras
+                .iter()
+                .map(|w| "-".repeat(*w))
+                .collect::<Vec<_>>()
+                .join("-+-")
+        );
+        for l in &texto {
+            println!("{}", linha(l));
+        }
+        println!("({} linha(s))", s.linhas.len());
+    }
+    println!("LSN {lsn}");
     Ok(())
 }

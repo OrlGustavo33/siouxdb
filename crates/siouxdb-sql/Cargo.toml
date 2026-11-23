@@ -1,0 +1,20 @@
+[package]
+name = "siouxdb-sql"
+description = "SQL do SiouxDB: analisador, planejador simples (chave primária e índices) e executor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+siouxdb-transacoes.workspace = true
+siouxdb-catalogo.workspace = true
+
+[dev-dependencies]
+siouxdb-armazenamento.workspace = true
+siouxdb-vfs.workspace = true
+
+[lints]
+workspace = true

@@ -344,6 +344,7 @@ dependencies = [
  "siouxdb-catalogo",
  "siouxdb-indices",
  "siouxdb-metricas",
+ "siouxdb-sql",
  "siouxdb-transacoes",
  "siouxdb-vfs",
 ]
@@ -399,6 +400,16 @@ version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "siouxdb-sql"
+version = "0.0.1"
+dependencies = [
+ "siouxdb-armazenamento",
+ "siouxdb-catalogo",
+ "siouxdb-transacoes",
+ "siouxdb-vfs",
 ]
 
 [[package]]

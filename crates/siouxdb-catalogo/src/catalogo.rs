@@ -7,7 +7,7 @@
 //! Criar e apagar tabela acontecem dentro de uma transação como qualquer outra gravação:
 //! valem (ou não) junto com o resto dela.
 
-use crate::tabela::{Coluna, DefTabela, Tabela};
+use crate::tabela::{Coluna, DefIndice, DefTabela, Tabela};
 use crate::valor::{Tipo, Valor, codificar_linha, decodificar_linha};
 use crate::{ErroCatalogo, Resultado};
 use siouxdb_indices::arvore::{self, Cursor};
@@ -64,6 +64,16 @@ fn codificar_def(d: &DefTabela) -> Vec<u8> {
     }
     v.push(Valor::Inteiro(d.chave.len() as i64));
     v.extend(d.chave.iter().map(|&i| Valor::Inteiro(i as i64)));
+    v.push(Valor::Inteiro(d.indices.len() as i64));
+    for i in &d.indices {
+        v.extend([
+            Valor::Texto(i.nome.clone()),
+            Valor::Booleano(i.unico),
+            Valor::Inteiro(i.raiz as i64),
+            Valor::Inteiro(i.colunas.len() as i64),
+        ]);
+        v.extend(i.colunas.iter().map(|&c| Valor::Inteiro(c as i64)));
+    }
     codificar_linha(&v)
 }
 
@@ -104,6 +114,33 @@ fn decodificar_def(b: &[u8]) -> Resultado<DefTabela> {
         }
         chave.push(i);
     }
+    let mut indices = Vec::new();
+    if let Some(Valor::Inteiro(n)) = it.next() {
+        for _ in 0..n.max(0) {
+            let Some(Valor::Texto(nome)) = it.next() else {
+                return Err(RUIM);
+            };
+            let Some(Valor::Booleano(unico)) = it.next() else {
+                return Err(RUIM);
+            };
+            let raiz = inteiro(&mut it)?;
+            let m = inteiro(&mut it)? as usize;
+            let mut cols = Vec::with_capacity(m.min(64));
+            for _ in 0..m {
+                let c = inteiro(&mut it)? as usize;
+                if c >= colunas.len() {
+                    return Err(RUIM);
+                }
+                cols.push(c);
+            }
+            indices.push(DefIndice {
+                nome,
+                colunas: cols,
+                unico,
+                raiz,
+            });
+        }
+    }
     if it.next().is_some() || chave.is_empty() {
         return Err(RUIM);
     }
@@ -113,6 +150,7 @@ fn decodificar_def(b: &[u8]) -> Resultado<DefTabela> {
         colunas,
         chave,
         cabecalho,
+        indices,
     })
 }
 
@@ -189,6 +227,7 @@ pub fn criar_tabela<P: PaginasMut + ?Sized>(
         colunas: cols,
         chave: posicoes,
         cabecalho,
+        indices: Vec::new(),
     };
     arvore::inserir(tx, raiz, &k, &codificar_def(&def)).map_err(|e| {
         match ErroCatalogo::from(e) {
@@ -305,6 +344,117 @@ pub fn sys_colunas<P: Paginas + ?Sized>(p: &P) -> Resultado<Vec<Vec<Valor>>> {
                     .iter()
                     .position(|&k| k == i)
                     .map_or(Valor::Nulo, |k| Valor::Inteiro(k as i64 + 1)),
+            ]);
+        }
+    }
+    Ok(v)
+}
+
+/// Cria um índice secundário em `tabela`, sobre as colunas dadas, e o preenche com as linhas
+/// atuais. `unico` recusa valores repetidos (nulos não contam).
+pub fn criar_indice<P: PaginasMut + ?Sized>(
+    tx: &mut P,
+    nome: &str,
+    tabela: &str,
+    colunas: &[&str],
+    unico: bool,
+) -> Resultado<()> {
+    let nome = normalizar_nome(nome)?;
+    if tabelas(tx)?
+        .iter()
+        .any(|t| t.def().indices.iter().any(|i| i.nome == nome))
+    {
+        return Err(ErroCatalogo::IndiceJaExiste(nome));
+    }
+    let t = tabela_obrigatoria(tx, tabela)?;
+    if colunas.is_empty() {
+        return Err(ErroCatalogo::DefinicaoInvalida(
+            "o índice precisa de ao menos uma coluna".into(),
+        ));
+    }
+    let mut posicoes = Vec::new();
+    for c in colunas {
+        let n = normalizar_nome(c)?;
+        let i = t
+            .def()
+            .colunas
+            .iter()
+            .position(|x| x.nome == n)
+            .ok_or_else(|| {
+                ErroCatalogo::DefinicaoInvalida(format!("a coluna \"{n}\" não existe"))
+            })?;
+        if posicoes.contains(&i) {
+            return Err(ErroCatalogo::DefinicaoInvalida(format!(
+                "coluna \"{n}\" repetida no índice"
+            )));
+        }
+        posicoes.push(i);
+    }
+    let raiz = arvore::criar(tx)?;
+    let idx = DefIndice {
+        nome,
+        colunas: posicoes,
+        unico,
+        raiz,
+    };
+    t.preencher_indice(tx, &idx)?;
+    let mut def = t.def().clone();
+    def.indices.push(idx);
+    arvore::inserir(
+        tx,
+        tx.meta().raiz_catalogo,
+        &chave_tabela(&def.nome),
+        &codificar_def(&def),
+    )?;
+    Ok(())
+}
+
+/// Apaga um índice pelo nome.
+pub fn remover_indice<P: PaginasMut + ?Sized>(tx: &mut P, nome: &str) -> Resultado<()> {
+    let nome = normalizar_nome(nome)?;
+    for t in tabelas(tx)? {
+        if let Some(pos) = t.def().indices.iter().position(|i| i.nome == nome) {
+            let mut def = t.def().clone();
+            let idx = def.indices.remove(pos);
+            arvore::liberar(tx, idx.raiz)?;
+            arvore::inserir(
+                tx,
+                tx.meta().raiz_catalogo,
+                &chave_tabela(&def.nome),
+                &codificar_def(&def),
+            )?;
+            return Ok(());
+        }
+    }
+    Err(ErroCatalogo::IndiceNaoExiste(nome))
+}
+
+/// Colunas da visão `sys_indices`.
+pub fn colunas_sys_indices() -> Vec<Coluna> {
+    vec![
+        Coluna::obrigatoria("tabela", Tipo::Texto),
+        Coluna::obrigatoria("nome", Tipo::Texto),
+        Coluna::obrigatoria("colunas", Tipo::Texto),
+        Coluna::obrigatoria("unico", Tipo::Booleano),
+    ]
+}
+
+/// Linhas da visão `sys_indices`: uma por índice secundário.
+pub fn sys_indices<P: Paginas + ?Sized>(p: &P) -> Resultado<Vec<Vec<Valor>>> {
+    let mut v = Vec::new();
+    for t in tabelas(p)? {
+        let d = t.def();
+        for i in &d.indices {
+            let cols: Vec<&str> = i
+                .colunas
+                .iter()
+                .map(|&c| d.colunas[c].nome.as_str())
+                .collect();
+            v.push(vec![
+                Valor::Texto(d.nome.clone()),
+                Valor::Texto(i.nome.clone()),
+                Valor::Texto(cols.join(", ")),
+                Valor::Booleano(i.unico),
             ]);
         }
     }

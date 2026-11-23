@@ -18,7 +18,10 @@ pub mod tabela;
 pub mod valor;
 
 pub use erro::{ErroCatalogo, Resultado};
-pub use tabela::{Coluna, Contagem, DefTabela, ResumoCompactacao, Tabela, Varredura, VersaoLinha};
+pub use tabela::{
+    Coluna, Contagem, DefIndice, DefTabela, ResumoCompactacao, Tabela, Varredura, VersaoLinha,
+    fim_do_prefixo,
+};
 pub use valor::{Tipo, Valor};
 
 #[cfg(test)]

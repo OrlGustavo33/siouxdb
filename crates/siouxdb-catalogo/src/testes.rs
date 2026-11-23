@@ -759,3 +759,85 @@ fn compactar_guarda_o_necessario_e_devolve_espaco() {
         "espaço liberado não foi reaproveitado"
     );
 }
+
+#[test]
+fn indices_secundarios_e_unico() {
+    let vfs = disco(8);
+    let b = criar(&vfs, true, Config::default());
+    let cols = [
+        Coluna::nova("id", Tipo::Inteiro),
+        Coluna::nova("email", Tipo::Texto),
+        Coluna::nova("cidade", Tipo::Texto),
+    ];
+    let mut tx = b.escrever().unwrap();
+    let t = criar_tabela(&mut tx, "pessoas", &cols, &["id"]).unwrap();
+    for (id, email, cidade) in [(1, "a@x", "SP"), (2, "b@x", "RJ"), (3, "c@x", "SP")] {
+        t.inserir(&mut tx, &[id.into(), email.into(), cidade.into()])
+            .unwrap();
+    }
+    t.inserir(&mut tx, &[4.into(), Valor::Nulo, "SP".into()])
+        .unwrap();
+    t.inserir(&mut tx, &[5.into(), Valor::Nulo, "MG".into()])
+        .unwrap();
+    // Índice criado com dados já existentes.
+    catalogo::criar_indice(&mut tx, "pessoas_cidade", "pessoas", &["cidade"], false).unwrap();
+    catalogo::criar_indice(&mut tx, "pessoas_email", "pessoas", &["email"], true).unwrap();
+    assert!(matches!(
+        catalogo::criar_indice(&mut tx, "pessoas_email", "pessoas", &["id"], false),
+        Err(ErroCatalogo::IndiceJaExiste(_))
+    ));
+    tx.confirmar().unwrap();
+
+    let busca = |b: &B, coluna_pos: usize, valor: &str| -> Vec<Valor> {
+        let l = b.ler().unwrap();
+        let t = catalogo::tabela(&l, "pessoas").unwrap().unwrap();
+        let p = crate::valor::codificar_chave(&[valor.into()]).unwrap();
+        let fim = crate::fim_do_prefixo(&p);
+        let mut ids: Vec<Valor> = t
+            .buscar_no_indice(&l, coluna_pos, Some(&p), Some(&fim))
+            .unwrap()
+            .iter()
+            .map(|pk| t.obter_por_bytes(&l, pk, u64::MAX).unwrap().unwrap()[0].clone())
+            .collect();
+        ids.sort_by(|a, b| a.comparar(b));
+        ids
+    };
+    assert_eq!(busca(&b, 0, "SP"), vec![1.into(), 3.into(), 4.into()]);
+    assert_eq!(busca(&b, 1, "b@x"), vec![2.into()]);
+
+    let mut tx = b.escrever().unwrap();
+    let t = catalogo::tabela(&tx, "pessoas").unwrap().unwrap();
+    // Único: recusa repetido, aceita nulo repetido, aceita regravar a mesma linha.
+    assert!(matches!(
+        t.inserir(&mut tx, &[6.into(), "a@x".into(), "BA".into()]),
+        Err(ErroCatalogo::UnicoViolado(_))
+    ));
+    t.inserir(&mut tx, &[6.into(), Valor::Nulo, "BA".into()])
+        .unwrap();
+    t.gravar(&mut tx, &[1.into(), "a@x".into(), "RJ".into()])
+        .unwrap();
+    t.remover(&mut tx, &[3.into()]).unwrap();
+    tx.confirmar().unwrap();
+    assert_eq!(busca(&b, 0, "SP"), vec![4.into()]);
+    assert_eq!(busca(&b, 0, "RJ"), vec![1.into(), 2.into()]);
+    assert!(busca(&b, 1, "c@x").is_empty());
+
+    // Índice sobrevive a fechar/abrir e some ao ser apagado.
+    drop(b);
+    vfs.queda();
+    let b = abrir(&vfs, true, Config::default());
+    assert_eq!(busca(&b, 0, "BA"), vec![6.into()]);
+    assert_eq!(catalogo::sys_indices(&b.ler().unwrap()).unwrap().len(), 2);
+    let mut tx = b.escrever().unwrap();
+    catalogo::remover_indice(&mut tx, "pessoas_cidade").unwrap();
+    assert!(matches!(
+        catalogo::remover_indice(&mut tx, "pessoas_cidade"),
+        Err(ErroCatalogo::IndiceNaoExiste(_))
+    ));
+    // Criar índice único sobre dados repetidos falha.
+    assert!(matches!(
+        catalogo::criar_indice(&mut tx, "u_cidade", "pessoas", &["cidade"], true),
+        Err(ErroCatalogo::UnicoViolado(_))
+    ));
+    tx.desfazer();
+}

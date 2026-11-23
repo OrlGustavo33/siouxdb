@@ -17,6 +17,7 @@
 //! - `GET  /tabelas/{t}/linhas/{chave}/historico`
 //! - `POST /tabelas/{t}/compactar?manter_lsn=` (sem `manter_lsn`: fica só a versão atual)
 //! - `POST /backup` (cópia a quente em `SIOUX_BACKUP_DIR`)
+//! - `POST /sql` `{"sql": "...", "params": [...]}`: um ou mais comandos numa transação só
 //! - filtro na listagem: `?onde=coluna:valor` (compara igual; varre a faixa)
 //!
 //! Tipos: `inteiro`, `real`, `texto`, `bytes` (base16), `booleano`. Chave composta: use a
@@ -484,6 +485,62 @@ async fn backup(State(app): Estado) -> R<Json<J>> {
     .await
 }
 
+fn valor_de_json(v: &J) -> R<Valor> {
+    Ok(match v {
+        J::Null => Valor::Nulo,
+        J::Bool(b) => Valor::Booleano(*b),
+        J::Number(n) => match n.as_i64() {
+            Some(i) => Valor::Inteiro(i),
+            None => Valor::Real(n.as_f64().ok_or_else(|| ruim("número inválido"))?),
+        },
+        J::String(s) => Valor::Texto(s.clone()),
+        _ => {
+            return Err(ruim(
+                "parâmetro precisa ser número, texto, booleano ou null",
+            ));
+        }
+    })
+}
+
+fn erro_sql(e: siouxdb::sql::ErroSql) -> Erro {
+    match e {
+        siouxdb::sql::ErroSql::Catalogo(c) => c.into(),
+        outro => Erro(StatusCode::BAD_REQUEST, outro.to_string()),
+    }
+}
+
+async fn sql(State(app): Estado, Json(corpo): Json<J>) -> R<Json<J>> {
+    let texto = corpo["sql"]
+        .as_str()
+        .ok_or_else(|| ruim("falta \"sql\""))?
+        .to_string();
+    let params: Vec<Valor> = match &corpo["params"] {
+        J::Null => Vec::new(),
+        J::Array(a) => a.iter().map(valor_de_json).collect::<R<_>>()?,
+        _ => return Err(ruim("\"params\" é uma lista")),
+    };
+    no_banco(&app, move |b| {
+        let saida_json = |s: siouxdb::sql::Saida| {
+            json!({
+                "colunas": s.colunas,
+                "linhas": s.linhas.iter().map(|l| l.iter().map(para_json).collect::<Vec<_>>()).collect::<Vec<_>>(),
+                "afetadas": s.afetadas,
+            })
+        };
+        // Só leitura e um comando: numa foto, sem esperar a vez de escrever.
+        if siouxdb::sql::somente_leitura(&texto).map_err(erro_sql)? && !texto.trim().trim_end_matches(';').contains(';') {
+            let l = b.ler()?;
+            let s = siouxdb::sql::consultar(&l, &texto, &params).map_err(erro_sql)?;
+            return Ok(Json(json!({ "lsn": l.lsn(), "resultados": [saida_json(s)] })));
+        }
+        let mut tx = b.escrever()?;
+        let saidas = siouxdb::sql::executar(&mut tx, &texto, &params).map_err(erro_sql)?;
+        let lsn = tx.confirmar()?;
+        Ok(Json(json!({ "lsn": lsn, "resultados": saidas.into_iter().map(saida_json).collect::<Vec<_>>() })))
+    })
+    .await
+}
+
 /// Token em tempo constante (não vaza, pelo tempo de resposta, quantos caracteres batem).
 fn iguais(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -548,6 +605,7 @@ async fn main() {
         .route("/tabelas/:t/linhas/:k/historico", get(historico))
         .route("/tabelas/:t/compactar", axum::routing::post(compactar))
         .route("/backup", axum::routing::post(backup))
+        .route("/sql", axum::routing::post(sql))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&app),
             exigir_token,
