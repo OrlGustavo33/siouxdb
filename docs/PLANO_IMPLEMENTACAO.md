@@ -2,7 +2,7 @@
 
 **Para:** quem vai construir o projeto (pessoas e agentes de IA).
 **Base:** o desenho do ecossistema (9 peças, roteiro v0.1 → v0.5+) descrito no README.
-**Situação em 22/11/2026:** M0, M1 e M2 prontos (disco real/simulado, páginas verificadas, cabeçalho duplo, cache SIEVE, cifra por página com senha Argon2id, CLI `criar`/`info`/`verificar`/`trocar-senha`) e o painel do Studio. Este documento é o caminho até a v0.5.
+**Situação em 22/11/2026:** M0, M1, M2 e M3 prontos (M3: WAL encadeado, transações tudo-ou-nada, escritor único com fila justa, confirmação em grupo, leitores com foto, checkpoint automático, trava de arquivo); antes disso, (disco real/simulado, páginas verificadas, cabeçalho duplo, cache SIEVE, cifra por página com senha Argon2id, CLI `criar`/`info`/`verificar`/`trocar-senha`) e o painel do Studio. Este documento é o caminho até a v0.5.
 
 **Requisitos acrescentados em 22/11:** o SiouxDB também roda em **modo servidor**, como o PostgreSQL (seção 2.11), com **gerência de conexões** cuidadosa (2.12), e o **Studio** tem um **painel de monitoramento em tempo real**, simples e objetivo (2.13).
 
@@ -38,7 +38,7 @@ siouxdb/
 │  ├─ siouxdb-cripto         # envelopes de chave, cifra de página e coluna, Argon2id, índice cego  ✅ M2
 │  ├─ siouxdb-armazenamento  # páginas, cache (SIEVE), WAL, camada quente, camada fria em colunas  ✅ M1
 │  ├─ siouxdb-razao          # cadeia de hashes, Merkle Mountain Range, pontos de controle assinados
-│  ├─ siouxdb-mvcc           # versões, fotos (snapshots), épocas, escritor único
+│  ├─ siouxdb-transacoes     # WAL, transações, escritor único com fila justa, fotos, checkpoint  ✅ M3
 │  ├─ siouxdb-indices        # B+tree, ART, índice adaptativo, índice aprendido (PGM)
 │  ├─ siouxdb-sql            # parser (sqlparser) + extensões, planejador, execução vetorizada
 │  ├─ siouxdb-catalogo       # catálogo do sistema (tabelas sys_*), usuários, permissões
@@ -67,7 +67,7 @@ siouxdb/
 └─ .github/workflows/
 ```
 
-Dependência entre crates (de baixo para cima): `vfs → cripto → armazenamento → razao/mvcc → indices → catalogo → sql → siouxdb → (capi, cli, servidor, ferramentas, bindings, studio)`. `metricas` não depende de nada e é usado por todos.
+Dependência entre crates (de baixo para cima): `vfs → cripto → armazenamento → transacoes → razao → indices → catalogo → sql → siouxdb → (capi, cli, servidor, ferramentas, bindings, studio)`. `metricas` não depende de nada e é usado por todos.
 
 Nomes de crates, tipos, funções e tabelas do sistema em **português** (ex.: `sys_conexoes`, não `sys_connections`).
 
@@ -261,7 +261,7 @@ Estimativas para **1 pessoa em tempo integral com apoio de agentes**. Cada marco
 | M0 (1 sem) | Repositório, workspace, CI (fmt, clippy, test, Miri, deny), licenças, `SECURITY.md`, `spec/FORMATO.md` v0 | CI verde no esqueleto |
 | M1 (2 sem) ✅ | VFS real e simulado; páginas; cabeçalho duplo; cache SIEVE | arquivo cria, abre e fecha; teste de queda no cabeçalho passa — **feito 22/11** |
 | M2 (2 sem) ✅ | Criptografia de página; Argon2id; keyring; chave-mestra embrulhada | arquivo ilegível sem chave; byte trocado é detectado — **feito 22/11** (falta só o keyring do sistema, que entra junto da API pública) |
-| M3 (3 sem) | WAL, transações, escritor único, leitores com foto, gravação em grupo, recuperação | simulador: 1 milhão de passos com quedas sem violar invariante |
+| M3 (3 sem) ✅ | WAL, transações, escritor único, leitores com foto, gravação em grupo, recuperação | simulador: 1 milhão de passos com quedas sem violar invariante — **feito 22/11**: teste de modelo com 240 execuções por rodada (claro/cifrado × Total/Normal), mais de 100 quedas incluindo checkpoint pela metade; teste de mutação confirma que ele pega recuperação errada. Falta a rodada noturna longa (milhões de passos) |
 | M4 (2 sem) | Camada quente + B+tree primária; catálogo `sys_*` | inserir, ler por chave e varrer 10 milhões de linhas |
 | M5 (3 sem) | SQL v0.1 (parser, planejador simples, execução em lotes) | `sqllogictest` básico igual ao SQLite |
 | M6 (2 sem) | Ledger: cadeia, MMR, pontos de controle assinados, `VERIFY`; `AS OF` | adulteração detectada; `AS OF` estável no simulador |

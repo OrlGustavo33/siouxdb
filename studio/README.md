@@ -8,11 +8,11 @@ Uma tela só, atualizada a cada segundo (pausa quando a janela fica oculta):
 
 - **Seis números grandes**, cada um com o gráfico dos últimos 60 s: conexões, operações por segundo, latência p99 (com p50), acerto do cache, gravações por segundo e tamanho do banco;
 - **alertas** em amarelo/vermelho, só quando algo passa do limite. Os limites são configuráveis (botão de ajustes);
-- **conexões agora** e **saúde**: fila do escritor, última verificação, confirmações, último LSN, páginas a liberar, backup e réplicas.
+- **conexões agora** e **saúde**: cifra, fila do escritor, última verificação, último LSN, checkpoint e páginas no WAL, confirmações por `fsync`, backup e réplicas.
 
 Fontes de dados:
 - **Arquivo** (`Abrir` / `Novo`): o Studio abre o arquivo `.sdb` e mede as operações que ele próprio faz;
-- **Demonstração**: cria um banco temporário e gera carga (ondas de leitura e gravação com picos) para ver o painel funcionando. O arquivo é apagado ao fechar;
+- **Demonstração**: cria um banco temporário cifrado com **3 escritores e 2 leitores ao mesmo tempo** (ondas de carga com picos), para ver o painel funcionando — inclusive fila do escritor e confirmação em grupo. Os arquivos são apagados ao fechar;
 - **Servidor** (quando o `sioux-servidor` existir): o mesmo painel, lendo `/painel/fluxo` do servidor, com todas as conexões e botões Cancelar/Derrubar.
 
 `Verificar` lê todas as páginas e confere a verificação de cada uma.

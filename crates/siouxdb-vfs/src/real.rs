@@ -20,6 +20,7 @@ impl VfsReal {
 #[derive(Debug)]
 pub struct ArquivoReal {
     arquivo: File,
+    caminho: std::path::PathBuf,
     somente_leitura: bool,
 }
 
@@ -53,6 +54,7 @@ impl Vfs for VfsReal {
         let arquivo = op.open(caminho).map_err(|e| traduzir(e, caminho))?;
         Ok(ArquivoReal {
             arquivo,
+            caminho: caminho.to_path_buf(),
             somente_leitura: modo == ModoAbertura::Leitura,
         })
     }
@@ -137,6 +139,19 @@ impl Arquivo for ArquivoReal {
         Ok(())
     }
 
+    fn travar_exclusivo(&self) -> Resultado<()> {
+        // `flock` no Unix (por abertura: vale também entre aberturas do mesmo processo) e
+        // `LockFile` no Windows. Solta sozinha quando o arquivo é fechado.
+        match fs4::fs_std::FileExt::try_lock_exclusive(&self.arquivo) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ErroVfs::EmUso(self.caminho.clone())),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                Err(ErroVfs::EmUso(self.caminho.clone()))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn sincronizar(&self) -> Resultado<()> {
         if self.somente_leitura {
             return Ok(());
@@ -172,6 +187,20 @@ mod testes {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn trava_exclusiva_entre_aberturas() {
+        let pasta = pasta_teste();
+        let vfs = VfsReal::novo();
+        let c = pasta.join("trava.sdb");
+        let a = vfs.abrir(&c, ModoAbertura::CriarNovo).unwrap();
+        a.travar_exclusivo().unwrap();
+        let b = vfs.abrir(&c, ModoAbertura::LeituraGravacao).unwrap();
+        assert!(matches!(b.travar_exclusivo(), Err(ErroVfs::EmUso(_))));
+        drop(a);
+        b.travar_exclusivo().unwrap();
+        std::fs::remove_dir_all(pasta).unwrap();
     }
 
     #[test]

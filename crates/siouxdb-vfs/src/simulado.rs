@@ -62,6 +62,9 @@ struct Estado {
     config: ConfigSimulacao,
     /// Aumenta a cada queda: arquivos abertos antes dela deixam de valer.
     geracao: u64,
+    /// Arquivos travados com exclusividade (caminho → id da abertura).
+    travados: HashMap<PathBuf, u64>,
+    proxima_abertura: u64,
 }
 
 /// Disco simulado. Clonar compartilha o mesmo disco.
@@ -77,6 +80,17 @@ pub struct ArquivoSimulado {
     caminho: PathBuf,
     somente_leitura: bool,
     geracao: u64,
+    id: u64,
+}
+
+impl Drop for ArquivoSimulado {
+    fn drop(&mut self) {
+        // Fechar solta a trava, como no disco real.
+        let mut e = self.estado.lock().unwrap_or_else(|e| e.into_inner());
+        if e.travados.get(&self.caminho) == Some(&self.id) {
+            e.travados.remove(&self.caminho);
+        }
+    }
 }
 
 /// Gerador pseudoaleatório pequeno e determinístico (SplitMix64).
@@ -126,6 +140,8 @@ impl VfsSimulado {
                 sorteio,
                 config,
                 geracao: 0,
+                travados: HashMap::new(),
+                proxima_abertura: 0,
             })),
         }
     }
@@ -139,6 +155,7 @@ impl VfsSimulado {
     /// usados (é como reiniciar o processo): abra de novo.
     pub fn queda(&self) {
         let mut e = self.travar();
+        e.travados.clear(); // o processo "reiniciou": travas somem
         let mut caminhos: Vec<PathBuf> = e.arquivos.keys().cloned().collect();
         caminhos.sort(); // ordem fixa: o sorteio não pode depender da ordem do HashMap
         for c in caminhos {
@@ -178,6 +195,7 @@ impl VfsSimulado {
     /// Queda em que **nenhuma** gravação pendente sobrevive (o pior caso, útil em testes).
     pub fn queda_perdendo_tudo(&self) {
         let mut e = self.travar();
+        e.travados.clear(); // o processo "reiniciou": travas somem
         for arq in e.arquivos.values_mut() {
             arq.atual = arq.duravel.clone();
             arq.pendentes.clear();
@@ -214,11 +232,13 @@ impl Vfs for VfsSimulado {
             }
             _ => {}
         }
+        e.proxima_abertura += 1;
         Ok(ArquivoSimulado {
             estado: Arc::clone(&self.estado),
             caminho: caminho.to_path_buf(),
             somente_leitura: modo == ModoAbertura::Leitura,
             geracao: e.geracao,
+            id: e.proxima_abertura,
         })
     }
 
@@ -301,6 +321,17 @@ impl Arquivo for ArquivoSimulado {
         })
     }
 
+    fn travar_exclusivo(&self) -> Resultado<()> {
+        let id = self.id;
+        self.com_arquivo(|e, c| match e.travados.get(c) {
+            Some(&dono) if dono != id => Err(ErroVfs::EmUso(c.clone())),
+            _ => {
+                e.travados.insert(c.clone(), id);
+                Ok(())
+            }
+        })
+    }
+
     fn sincronizar(&self) -> Resultado<()> {
         if self.somente_leitura {
             return Ok(());
@@ -335,6 +366,30 @@ mod testes {
         let mut buf = vec![0u8; a.tamanho().unwrap() as usize];
         a.ler_exato_em(0, &mut buf).unwrap();
         buf
+    }
+
+    #[test]
+    fn trava_some_ao_fechar_e_na_queda() {
+        let vfs = VfsSimulado::novo(ConfigSimulacao::default());
+        let a = vfs.abrir(Path::new("t"), ModoAbertura::CriarNovo).unwrap();
+        a.travar_exclusivo().unwrap();
+        a.travar_exclusivo().unwrap(); // a mesma abertura pode repetir
+        let b = vfs
+            .abrir(Path::new("t"), ModoAbertura::LeituraGravacao)
+            .unwrap();
+        assert!(matches!(b.travar_exclusivo(), Err(ErroVfs::EmUso(_))));
+        drop(a);
+        b.travar_exclusivo().unwrap();
+        vfs.queda();
+        let c = vfs
+            .abrir(Path::new("t"), ModoAbertura::LeituraGravacao)
+            .unwrap();
+        c.travar_exclusivo().unwrap();
+        drop(b); // abertura de antes da queda não solta a trava de depois
+        let d = vfs
+            .abrir(Path::new("t"), ModoAbertura::LeituraGravacao)
+            .unwrap();
+        assert!(d.travar_exclusivo().is_err());
     }
 
     #[test]

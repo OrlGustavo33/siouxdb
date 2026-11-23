@@ -18,12 +18,12 @@ mod erro;
 mod pagina;
 mod paginador;
 
-pub use cabecalho::{Cabecalho, Protecao, TAMANHO_CABECALHO};
+pub use cabecalho::{Cabecalho, Protecao, TAMANHO_CABECALHO, TAMANHO_ID};
 pub use cache::{CacheSieve, EstatisticasCache};
-pub use crc::crc32c;
+pub use crc::{crc32c, crc32c_continuar};
 pub use erro::{ErroArmazenamento, Resultado};
 pub use pagina::{CABECALHO_PAGINA, Pagina, TipoPagina};
-pub use paginador::{EstatisticasPaginador, Paginador, SenhaNova};
+pub use paginador::{EstatisticasPaginador, Meta, Paginador, SenhaNova};
 pub use siouxdb_cripto::ParametrosSenha;
 
 /// Número de uma página dentro do arquivo (a página 0 começa no byte 0).

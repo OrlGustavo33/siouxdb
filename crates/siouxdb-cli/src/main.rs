@@ -6,22 +6,20 @@
 //! sioux info  <arquivo>
 //! sioux verificar <arquivo>
 //! sioux trocar-senha <arquivo>
+//! sioux checkpoint <arquivo>
 //! ```
 //!
 //! Arquivos novos são **cifrados por padrão**. A senha é pedida no terminal (sem eco) ou
 //! lida da variável `SIOUX_SENHA` (para scripts; a nova senha de `trocar-senha` vem de
 //! `SIOUX_SENHA_NOVA`).
 
-use siouxdb::armazenamento::{
-    ErroArmazenamento, PAGINAS_RESERVADAS, Paginador, ParametrosSenha, SenhaNova, TamanhoPagina,
-};
+use siouxdb::armazenamento::{ErroArmazenamento, ParametrosSenha, SenhaNova, TamanhoPagina};
+use siouxdb::transacoes::{Banco, Config, ErroBanco};
 use siouxdb::vfs::{Vfs, VfsReal};
 use std::path::Path;
 use std::process::ExitCode;
 
-type Pag = Paginador<<VfsReal as Vfs>::Arquivo>;
-
-const CACHE: usize = 64;
+type Bd = Banco<<VfsReal as Vfs>::Arquivo>;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,6 +37,7 @@ fn main() -> ExitCode {
         ["info", arquivo] => info(arquivo),
         ["verificar", arquivo] => verificar(arquivo),
         ["trocar-senha", arquivo] => trocar_senha(arquivo),
+        ["checkpoint", arquivo] => checkpoint(arquivo),
         _ => {
             ajuda();
             return ExitCode::from(2);
@@ -101,13 +100,17 @@ fn validar_senha(s: String) -> Result<String, String> {
     Ok(s)
 }
 
-/// Abre em claro; se o arquivo for cifrado, pede a senha.
-fn abrir(arquivo: &str) -> Result<Pag, String> {
+/// Abre o banco (recuperando o WAL); se for cifrado, pede a senha.
+fn abrir(arquivo: &str) -> Result<Bd, String> {
     let vfs = VfsReal::novo();
-    match Pag::abrir(&vfs, Path::new(arquivo), CACHE) {
-        Err(ErroArmazenamento::SenhaNecessaria) => {
+    let caminho = Path::new(arquivo);
+    if !caminho.exists() {
+        return Err(format!("o arquivo não existe: {arquivo}"));
+    }
+    match Bd::abrir(&vfs, caminho, None, Config::default()) {
+        Err(ErroBanco::Armazenamento(ErroArmazenamento::SenhaNecessaria)) => {
             let senha = pedir_senha("SIOUX_SENHA", "Senha: ")?;
-            Pag::abrir_com(&vfs, Path::new(arquivo), CACHE, Some(senha.as_bytes()))
+            Bd::abrir(&vfs, caminho, Some(senha.as_bytes()), Config::default())
                 .map_err(|e| e.to_string())
         }
         r => r.map_err(|e| e.to_string()),
@@ -152,8 +155,15 @@ fn criar(arquivo: &str, resto: &[&str]) -> Result<(), String> {
         senha: s.as_bytes(),
         parametros: ParametrosSenha::default(),
     });
-    let p = Pag::criar_com(&VfsReal::novo(), Path::new(arquivo), tamanho, CACHE, senha)
-        .map_err(|e| e.to_string())?;
+    let b = Bd::criar(
+        &VfsReal::novo(),
+        Path::new(arquivo),
+        tamanho,
+        senha,
+        Config::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    let p = b.paginador();
     let modo = if p.cifrado() {
         "cifrado"
     } else {
@@ -167,8 +177,11 @@ fn criar(arquivo: &str, resto: &[&str]) -> Result<(), String> {
 }
 
 fn info(arquivo: &str) -> Result<(), String> {
-    let p = abrir(arquivo)?;
+    let b = abrir(arquivo)?;
+    let p = b.paginador();
     let c = p.cabecalho();
+    let meta = b.ler().map_err(|e| e.to_string())?.meta();
+    let est = b.estatisticas();
     let tam = c.tamanho_pagina.bytes() as u64;
     println!("arquivo          {arquivo}");
     println!("formato          {}", siouxdb::VERSAO_FORMATO);
@@ -186,26 +199,37 @@ fn info(arquivo: &str) -> Result<(), String> {
         tam / 1024,
         p.tamanho_util()
     );
-    println!("páginas          {}", c.total_paginas);
-    println!("tamanho          {} bytes", c.total_paginas * tam);
-    println!("geração          {}", c.geracao);
-    println!("raiz do catálogo {}", c.raiz_catalogo);
-    println!("raiz do razão    {}", c.raiz_razao);
-    println!("último LSN       {}", c.ultimo_lsn);
-    println!("primeira livre   {}", c.primeira_livre);
+    println!("páginas          {}", meta.total_paginas);
+    println!(
+        "tamanho          {} bytes (+ {} no WAL)",
+        meta.total_paginas * tam,
+        est.bytes_wal
+    );
+    println!(
+        "último LSN       {} (checkpoint em {})",
+        est.lsn_escrito, est.lsn_checkpoint
+    );
+    println!("páginas no WAL   {}", est.paginas_no_wal);
+    println!("raiz do catálogo {}", meta.raiz_catalogo);
+    println!("raiz do razão    {}", meta.raiz_razao);
+    println!("primeira livre   {}", meta.primeira_livre);
+    println!("geração cabeçalho {}", c.geracao);
     Ok(())
 }
 
 fn verificar(arquivo: &str) -> Result<(), String> {
-    let p = abrir(arquivo)?;
-    let total = p.cabecalho().total_paginas;
+    let b = abrir(arquivo)?;
+    let leitura = b.ler().map_err(|e| e.to_string())?;
+    let total = leitura.meta().total_paginas;
     let mut ruins = 0u64;
-    for n in PAGINAS_RESERVADAS..total {
-        match p.ler(n) {
+    for n in siouxdb::armazenamento::PAGINAS_RESERVADAS..total {
+        match leitura.pagina(n) {
             Ok(_) => {}
             Err(
-                e @ (ErroArmazenamento::PaginaCorrompida(_)
-                | ErroArmazenamento::PaginaForaDoLugar { .. }),
+                e @ ErroBanco::Armazenamento(
+                    ErroArmazenamento::PaginaCorrompida(_)
+                    | ErroArmazenamento::PaginaForaDoLugar { .. },
+                ),
             ) => {
                 ruins += 1;
                 println!("  {e}");
@@ -214,7 +238,10 @@ fn verificar(arquivo: &str) -> Result<(), String> {
         }
     }
     if ruins == 0 {
-        println!("ok: {total} páginas, todas íntegras");
+        println!(
+            "ok: {total} páginas, todas íntegras (LSN {})",
+            leitura.lsn()
+        );
         Ok(())
     } else {
         Err(format!("{ruins} página(s) com problema"))
@@ -222,7 +249,8 @@ fn verificar(arquivo: &str) -> Result<(), String> {
 }
 
 fn trocar_senha(arquivo: &str) -> Result<(), String> {
-    let p = abrir(arquivo)?;
+    let b = abrir(arquivo)?;
+    let p = b.paginador();
     if !p.cifrado() {
         return Err("o arquivo não é cifrado".into());
     }
@@ -233,5 +261,18 @@ fn trocar_senha(arquivo: &str) -> Result<(), String> {
     })
     .map_err(|e| e.to_string())?;
     println!("senha trocada");
+    Ok(())
+}
+
+fn checkpoint(arquivo: &str) -> Result<(), String> {
+    let b = abrir(arquivo)?;
+    let antes = b.estatisticas();
+    b.checkpoint().map_err(|e| e.to_string())?;
+    let depois = b.estatisticas();
+    println!(
+        "checkpoint: {} página(s) do WAL passaram para o arquivo principal (LSN {})",
+        antes.paginas_no_wal - depois.paginas_no_wal,
+        depois.lsn_checkpoint
+    );
     Ok(())
 }

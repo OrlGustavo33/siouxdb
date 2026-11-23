@@ -76,14 +76,29 @@ Só o motor é obrigatório; o resto é opcional. Embutido (como o SQLite) ou se
 | v0.4 | Análise e desempenho: colunas, índices adaptativo e aprendido, perfis e ajuste automático |
 | v0.5+ | Cluster com Raft e IA local |
 
-**Feito até agora (M0, M1 e M2):**
+**Feito até agora (M0 a M3):**
 - workspace e CI em Linux, macOS e Windows;
 - `siouxdb-vfs`: disco real e disco simulado. O simulado reproduz queda de energia com gravações perdidas ou cortadas no meio de um setor, de forma determinística por semente;
 - `siouxdb-armazenamento`: páginas com verificação (CRC32C + número da página), cabeçalho em duas cópias alternadas, cache SIEVE e paginador. Testado com centenas de quedas simuladas: nunca aceita página misturada;
 - `siouxdb-cripto`: arquivo **cifrado por padrão** — cada página com XChaCha20-Poly1305 (página trocada de lugar ou alterada não decifra), senha por Argon2id, chave do arquivo em envelope (trocar a senha não recifra nada) e cabeçalho autenticado. Os testes de queda de energia rodam também com cifra;
-- comando `sioux criar | info | verificar | trocar-senha`.
+- `siouxdb-transacoes`: **WAL** com CRC encadeado, transações **tudo ou nada**, um escritor por vez em **fila justa**, **confirmação em grupo**, leitores com **foto** que nunca esperam, checkpoint automático e **trava de arquivo**. Sincronia configurável (`Total`: nada confirmado se perde; `Normal`: mais rápido). Testado com um modelo que roda transações e quedas de energia aleatórias nos quatro modos (claro/cifrado × Total/Normal);
+- comando `sioux criar | info | verificar | trocar-senha | checkpoint`.
 - `siouxdb-metricas`: histograma sem trava, séries de 60 s e alertas configuráveis;
 - **SiouxDB Studio** (`studio/`, Tauri): painel de monitoramento em tempo real sobre um arquivo ou uma demonstração com carga gerada.
+
+### Primeiros números (pré-alfa)
+
+Banco **cifrado**, páginas de 8 KiB, cada transação altera 1 página, 2 leitores lendo o tempo todo. Intel i5-7500T (4 núcleos), SSD SATA, ext4, Linux. Medido com `cargo run --release -p siouxdb-transacoes --example carga -- <escritores> 4 <total|normal>`:
+
+| Sincronia | Escritores | Confirmações/s | Confirmações por `fsync` | Latência p50 / p99 |
+|---|---|---|---|---|
+| Total | 1 | 360 | 1,0 | 2,9 / 6,3 ms |
+| Total | 8 | 1.348 | 4,1 | 5,8 / 12,6 ms |
+| Total | 32 | 4.115 | 15,1 | 7,3 / 23,1 ms |
+| Normal | 1 | 7.788 | 205 | 0,07 / 0,18 ms |
+| Normal | 8 | 6.291 | 208 | 0,85 / 9,4 ms |
+
+Na sincronia Total o limite é o `fsync` do disco; a confirmação em grupo é o que faz o número subir com mais escritores. Ainda não há comparação com SQLite (fica para o M8, com o mesmo roteiro de carga).
 
 ## Compilar e testar
 

@@ -51,6 +51,11 @@ pub trait Arquivo: Send + Sync {
     /// Corta (ou aumenta com zeros) o arquivo para `tamanho` bytes.
     fn truncar(&self, tamanho: u64) -> Resultado<()>;
 
+    /// Trava o arquivo com exclusividade enquanto esta abertura existir (a trava é solta
+    /// ao fechar). Não espera: se outro processo ou outra abertura já travou, devolve
+    /// [`ErroVfs::EmUso`].
+    fn travar_exclusivo(&self) -> Resultado<()>;
+
     /// Lê exatamente `destino.len()` bytes; erro se o arquivo acabar antes.
     fn ler_exato_em(&self, posicao: u64, destino: &mut [u8]) -> Resultado<()> {
         let lidos = self.ler_em(posicao, destino)?;

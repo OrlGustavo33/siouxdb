@@ -25,7 +25,13 @@ const TABELA: [u32; 256] = {
 
 /// CRC32C dos dados.
 pub fn crc32c(dados: &[u8]) -> u32 {
-    let mut c = !0u32;
+    crc32c_continuar(0, dados)
+}
+
+/// Continua um CRC32C: `crc32c_continuar(crc32c(a), b) == crc32c(a ++ b)`.
+/// Usado para encadear os quadros do WAL.
+pub fn crc32c_continuar(crc: u32, dados: &[u8]) -> u32 {
+    let mut c = !crc;
     for &b in dados {
         c = TABELA[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
     }
@@ -34,7 +40,7 @@ pub fn crc32c(dados: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod testes {
-    use super::crc32c;
+    use super::{crc32c, crc32c_continuar};
 
     #[test]
     fn vetores_conhecidos() {
@@ -43,5 +49,9 @@ mod testes {
         assert_eq!(crc32c(b""), 0);
         // RFC 3720 (iSCSI): 32 bytes zerados.
         assert_eq!(crc32c(&[0u8; 32]), 0x8A91_36AA);
+        assert_eq!(
+            crc32c_continuar(crc32c(b"12345"), b"6789"),
+            crc32c(b"123456789")
+        );
     }
 }

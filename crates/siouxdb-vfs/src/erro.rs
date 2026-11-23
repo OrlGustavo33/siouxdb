@@ -26,6 +26,8 @@ pub enum ErroVfs {
     DiscoCheio,
     /// Arquivo aberto só para leitura.
     SomenteLeitura,
+    /// Outro processo (ou outra abertura) já está usando o arquivo com exclusividade.
+    EmUso(PathBuf),
     /// Falha provocada de propósito pelo disco simulado.
     FalhaSimulada(&'static str),
 }
@@ -33,6 +35,11 @@ pub enum ErroVfs {
 impl fmt::Display for ErroVfs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ErroVfs::EmUso(c) => write!(
+                f,
+                "o arquivo já está em uso por outro programa: {}",
+                c.display()
+            ),
             ErroVfs::Io(e) => write!(f, "erro de disco: {e}"),
             ErroVfs::NaoEncontrado(c) => write!(f, "arquivo não encontrado: {}", c.display()),
             ErroVfs::JaExiste(c) => write!(f, "arquivo já existe: {}", c.display()),

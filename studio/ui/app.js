@@ -64,7 +64,7 @@ const CARTOES = [
   {
     titulo: "Conexões", alerta: "conexoes_ativas", serie: "conexoes",
     valor: (i) => ({ v: num.format(i.conexoes_ativas), u: i.conexoes_limite ? `/ ${num.format(i.conexoes_limite)}` : "" }),
-    sub: (i, r) => (r.origem === "servidor" ? "conectadas ao servidor" : "modo embutido"),
+    sub: (i, r) => (r.origem === "servidor" ? "conectadas ao servidor" : "sessões abertas · modo embutido"),
   },
   {
     titulo: "Operações", alerta: null, serie: "operacoes_por_s",
@@ -92,6 +92,12 @@ const CARTOES = [
     sub: (i, r) => `${num.format(r.paginas)} páginas de ${r.pagina_kb} KiB`,
   },
 ];
+
+function grupo(r) {
+  if (!r.confirmacoes) return "—";
+  const media = r.confirmacoes / Math.max(1, r.sincronizacoes);
+  return `${num1.format(media)} confirmações por fsync`;
+}
 
 function nivelDe(alertas, indicador) {
   if (!indicador) return "";
@@ -126,8 +132,10 @@ function desenhar(r) {
   }).join("");
 
   // Conexões: no modo embutido a única sessão é o próprio Studio.
-  $("conexoes").innerHTML = `<tr><td>1</td><td>este Studio</td><td>local</td>
-    <td class="estado-ativo">ativa</td><td>${resumo.origem === "demonstracao" ? "carga de demonstração" : "—"}</td></tr>`;
+  $("conexoes").innerHTML = resumo.origem === "demonstracao"
+    ? ["escritor 1", "escritor 2", "escritor 3", "leitor 1", "leitor 2"]
+        .map((q, k) => `<tr><td>${k + 1}</td><td>${q}</td><td>local</td><td class="estado-ativo">ativa</td><td>carga de demonstração</td></tr>`).join("")
+    : `<tr><td>1</td><td>este Studio</td><td>local</td><td class="estado-ativo">ativa</td><td>—</td></tr>`;
   $("nota-conexoes").textContent =
     "Em modo servidor esta lista mostra todas as conexões (usuário, origem, consulta atual e há quanto tempo), com Cancelar e Derrubar.";
 
@@ -143,9 +151,9 @@ function desenhar(r) {
     <dt>Cifra</dt><dd class="${resumo.cifrado ? "ok" : "ruim"}">${resumo.cifrado ? "XChaCha20-Poly1305" : "nenhuma (em claro)"}</dd>
     <dt>Fila do escritor</dt><dd class="${filaNivel ? "ruim" : ""}">${num.format(i.fila_escritor)}</dd>
     <dt>Verificação</dt>${verif}
-    <dt>Confirmações (geração)</dt><dd>${num.format(resumo.geracao)}</dd>
-    <dt>Último LSN</dt><dd>${num.format(resumo.ultimo_lsn)}</dd>
-    <dt>Páginas a liberar</dt><dd>${num.format(resumo.liberadas_pendentes)}</dd>
+    <dt>Último LSN</dt><dd>${num.format(resumo.lsn)}</dd>
+    <dt>Checkpoint</dt><dd>LSN ${num.format(resumo.lsn_checkpoint)} · ${num.format(resumo.paginas_wal)} pág. no WAL</dd>
+    <dt>Confirmação em grupo</dt><dd>${grupo(resumo)}</dd>
     <dt>Backup</dt><dd>não configurado</dd>
     <dt>Réplicas</dt><dd>não configuradas</dd>`;
 }
@@ -210,7 +218,7 @@ async function executar(acao) {
       case "cancelar-arquivo": $("barra-arquivo").hidden = true; return;
       case "demonstracao":
         await api("demonstracao");
-        avisar("Demonstração iniciada: banco temporário cifrado, com carga gerada pelo Studio. Ele é apagado ao fechar.", true);
+        avisar("Demonstração iniciada: banco temporário cifrado com 3 escritores e 2 leitores ao mesmo tempo. Ele é apagado ao fechar.", true);
         break;
       case "fechar":
         await api("fechar");
@@ -296,12 +304,12 @@ function criarPrevia() {
     const ops = 3000 + 27000 * onda * (Math.random() < 0.03 ? 3 : 1);
     paginas = Math.min(4000, paginas + Math.round(ops * 0.25 / 20));
     const ind = {
-      conexoes_ativas: 1, conexoes_limite: 0, operacoes_por_s: ops,
+      conexoes_ativas: 5, conexoes_limite: 0, operacoes_por_s: ops,
       latencia_p50_us: 3 + Math.random() * 2, latencia_p99_us: 900 + 1500 * Math.random(),
       acerto_cache_pct: 88 + Math.random() * 10, gravacoes_por_s: ops * 0.25,
       confirmacoes_por_s: ops / 400, bytes_banco: paginas * 4096, fila_escritor: 0,
     };
-    push("conexoes", 1); push("operacoes_por_s", ind.operacoes_por_s); push("latencia_p99_us", ind.latencia_p99_us);
+    push("conexoes", 5); push("operacoes_por_s", ind.operacoes_por_s); push("latencia_p99_us", ind.latencia_p99_us);
     push("acerto_cache_pct", ind.acerto_cache_pct); push("gravacoes_por_s", ind.gravacoes_por_s); push("bytes_banco", ind.bytes_banco);
     const alertas = [];
     if (ind.latencia_p99_us > limites.latencia_p99_us) alertas.push({ nivel: "Aviso", indicador: "latencia_p99_us", mensagem: "latência p99 acima do limite" });
@@ -312,7 +320,7 @@ function criarPrevia() {
   setInterval(() => { if (sessao) foto = passo(); }, 1000);
   return async (cmd, args) => {
     switch (cmd) {
-      case "demonstracao": sessao = { origem: "demonstracao", caminho: "/tmp/siouxdb-studio-demo.sdb", pagina_kb: 4, cifrado: true }; foto = passo(); return {};
+      case "demonstracao": sessao = { origem: "demonstracao", caminho: "/tmp/siouxdb-studio-demo.sdb", pagina_kb: 4, cifrado: true, lsn_checkpoint: 0 }; foto = passo(); return {};
       case "abrir": case "criar": throw "Prévia no navegador: abrir e criar arquivos só no aplicativo.";
       case "fechar": sessao = null; return null;
       case "verificar": verificacao = { quando: Date.now() / 1000, paginas, problemas: [], duracao_ms: 12 }; return verificacao;
@@ -320,7 +328,7 @@ function criarPrevia() {
       case "painel":
         if (!sessao) return null;
         return {
-          resumo: { ...sessao, paginas, geracao: t, ultimo_lsn: 0, liberadas_pendentes: 3, versao: "0.0.1" },
+          resumo: { ...sessao, paginas, lsn: t * 180, lsn_checkpoint: Math.floor(t / 10) * 1800, paginas_wal: (t % 10) * 45, confirmacoes: t * 180, sincronizacoes: t * 41, versao: "0.0.1" },
           foto, limites, verificacao,
         };
     }

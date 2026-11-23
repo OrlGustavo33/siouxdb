@@ -25,8 +25,8 @@ use crate::{
     Pagina, Resultado, TAMANHO_CABECALHO, TamanhoPagina, TipoPagina,
 };
 use siouxdb_cripto::{
-    Chave, CifraPagina, ParametrosSenha, SOBRA_CIFRA, TAMANHO_NONCE, TAMANHO_TAG, derivar_da_senha,
-    desembrulhar, embrulhar, sal_aleatorio,
+    Chave, CifraPagina, ParametrosSenha, SOBRA_CIFRA, TAMANHO_NONCE, TAMANHO_TAG, bytes_aleatorios,
+    derivar_da_senha, desembrulhar, embrulhar, sal_aleatorio,
 };
 use siouxdb_metricas::{FotoHistograma, Histograma, Leitura};
 use siouxdb_vfs::{Arquivo, ModoAbertura, Vfs};
@@ -83,6 +83,63 @@ impl std::fmt::Debug for SenhaNova<'_> {
     }
 }
 
+/// Estado lógico do banco guardado no cabeçalho (o que uma confirmação muda).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Meta {
+    /// Total de páginas (inclui as reservadas).
+    pub total_paginas: NumeroPagina,
+    /// Primeira página livre (0 = nenhuma).
+    pub primeira_livre: NumeroPagina,
+    /// Raiz do catálogo.
+    pub raiz_catalogo: NumeroPagina,
+    /// Raiz do livro-razão.
+    pub raiz_razao: NumeroPagina,
+    /// Último LSN confirmado.
+    pub ultimo_lsn: u64,
+}
+
+impl Meta {
+    /// Bytes desta meta (40, little-endian), usados no WAL.
+    pub fn codificar(&self) -> [u8; 40] {
+        let mut b = [0u8; 40];
+        for (i, v) in [
+            self.total_paginas,
+            self.primeira_livre,
+            self.raiz_catalogo,
+            self.raiz_razao,
+            self.ultimo_lsn,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    /// Lê de [`Meta::codificar`].
+    pub fn decodificar(b: &[u8; 40]) -> Meta {
+        let v = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+        Meta {
+            total_paginas: v(0),
+            primeira_livre: v(1),
+            raiz_catalogo: v(2),
+            raiz_razao: v(3),
+            ultimo_lsn: v(4),
+        }
+    }
+
+    fn de_cabecalho(c: &Cabecalho) -> Meta {
+        Meta {
+            total_paginas: c.total_paginas,
+            primeira_livre: c.primeira_livre,
+            raiz_catalogo: c.raiz_catalogo,
+            raiz_razao: c.raiz_razao,
+            ultimo_lsn: c.ultimo_lsn,
+        }
+    }
+}
+
 /// Dono do arquivo do banco. Pode ser compartilhado entre threads.
 pub struct Paginador<A: Arquivo> {
     arquivo: A,
@@ -132,8 +189,10 @@ impl<A: Arquivo> Paginador<A> {
             }
         };
         let arquivo = vfs.abrir(caminho, ModoAbertura::CriarNovo)?;
+        arquivo.travar_exclusivo()?;
         let tam = tamanho.bytes();
         let mut cabecalho = Cabecalho::novo(tamanho, protecao);
+        bytes_aleatorios(&mut cabecalho.id_arquivo)?;
         let chave = chave.map(|c| {
             let cifra = CifraPagina::nova(c.clone());
             (c, cifra)
@@ -185,6 +244,8 @@ impl<A: Arquivo> Paginador<A> {
         senha: Option<&[u8]>,
     ) -> Resultado<Self> {
         let arquivo = vfs.abrir(caminho, ModoAbertura::LeituraGravacao)?;
+        // Um banco, um dono: outro processo (ou outra abertura) recebe "em uso".
+        arquivo.travar_exclusivo()?;
         let tamanho_arquivo = arquivo.tamanho()?;
         if tamanho_arquivo < TAMANHO_CABECALHO as u64 {
             return Err(ErroArmazenamento::NaoEhSiouxDb);
@@ -300,6 +361,102 @@ impl<A: Arquivo> Paginador<A> {
         self.estado_usavel()?.cabecalho.protecao = Some(protecao);
         self.confirmar()?;
         self.confirmar()
+    }
+
+    /// Identificador sorteado na criação do arquivo.
+    pub fn id_arquivo(&self) -> [u8; crate::TAMANHO_ID] {
+        self.travar_estado().cabecalho.id_arquivo
+    }
+
+    /// Estado lógico atual (em memória; inclui o que ainda não foi confirmado).
+    pub fn meta(&self) -> Meta {
+        Meta::de_cabecalho(&self.travar_estado().cabecalho)
+    }
+
+    /// Troca o estado lógico de uma vez (usado pelo checkpoint do WAL). Vale no disco a
+    /// partir da próxima [`Paginador::confirmar`].
+    pub fn definir_meta(&self, m: Meta) -> Resultado<()> {
+        if m.total_paginas < PAGINAS_RESERVADAS {
+            return Err(ErroArmazenamento::CabecalhoCorrompido);
+        }
+        let mut e = self.estado_usavel()?;
+        let c = &mut e.cabecalho;
+        c.total_paginas = m.total_paginas;
+        c.primeira_livre = m.primeira_livre;
+        c.raiz_catalogo = m.raiz_catalogo;
+        c.raiz_razao = m.raiz_razao;
+        c.ultimo_lsn = m.ultimo_lsn;
+        Ok(())
+    }
+
+    /// Converte a página para o formato do disco na posição `numero`: verificação e, se o
+    /// arquivo for cifrado, cifra. É o que vai para o arquivo e para o WAL.
+    pub fn para_disco(&self, numero: NumeroPagina, pagina: &mut Pagina) -> Resultado<Vec<u8>> {
+        if pagina.tamanho() != self.util {
+            return Err(ErroArmazenamento::TamanhoDeBufferErrado {
+                esperado: self.util,
+                recebido: pagina.tamanho(),
+            });
+        }
+        Ok(match self.cifra() {
+            None => pagina.selar(numero).to_vec(),
+            Some(cifra) => {
+                let mut disco = vec![0u8; self.tamanho.bytes()];
+                disco[TAMANHO_NONCE..TAMANHO_NONCE + self.util]
+                    .copy_from_slice(pagina.selar(numero));
+                cifra.cifrar(numero, crate::VERSAO_FORMATO, &mut disco)?;
+                disco
+            }
+        })
+    }
+
+    /// O contrário de [`Paginador::para_disco`]: confere (e decifra) bytes lidos do disco ou
+    /// do WAL. Gravação cortada, página trocada ou alterada viram
+    /// [`ErroArmazenamento::PaginaCorrompida`] / [`ErroArmazenamento::PaginaForaDoLugar`].
+    pub fn do_disco(&self, numero: NumeroPagina, mut dados: Box<[u8]>) -> Resultado<Pagina> {
+        if dados.len() != self.tamanho.bytes() {
+            return Err(ErroArmazenamento::PaginaCorrompida(numero));
+        }
+        if let Some(cifra) = self.cifra() {
+            // Gravação cortada por queda também cai aqui: para quem lê é igual a adulterada.
+            cifra
+                .decifrar(numero, crate::VERSAO_FORMATO, &mut dados)
+                .map_err(|_| ErroArmazenamento::PaginaCorrompida(numero))?;
+            dados = dados[TAMANHO_NONCE..dados.len() - TAMANHO_TAG].into();
+        }
+        Pagina::de_bytes(dados, numero)
+    }
+
+    /// Grava bytes já no formato do disco (vindos do WAL, no checkpoint), sem sincronizar,
+    /// e tira a página do cache.
+    pub fn gravar_do_disco(&self, numero: NumeroPagina, dados: &[u8]) -> Resultado<()> {
+        if numero < PAGINAS_RESERVADAS {
+            return Err(ErroArmazenamento::PaginaInexistente(numero));
+        }
+        if dados.len() != self.tamanho.bytes() {
+            return Err(ErroArmazenamento::TamanhoDeBufferErrado {
+                esperado: self.tamanho.bytes(),
+                recebido: dados.len(),
+            });
+        }
+        drop(self.estado_usavel()?);
+        let r = self.arquivo.gravar_em(self.posicao(numero), dados);
+        self.gravacoes.fetch_add(1, Ordering::Relaxed);
+        self.travar_cache().remover(&numero);
+        Ok(r?)
+    }
+
+    /// Etiqueta que autentica `dados` com a chave do arquivo (`None` se em claro).
+    pub fn autenticar(&self, dados: &[u8]) -> Resultado<Option<[u8; SOBRA_CIFRA]>> {
+        self.cifra()
+            .map(|c| c.autenticar(dados))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Confere uma etiqueta de [`Paginador::autenticar`]. Em claro, sempre verdadeiro.
+    pub fn conferir_autenticacao(&self, dados: &[u8], etiqueta: &[u8; SOBRA_CIFRA]) -> bool {
+        self.cifra().is_none_or(|c| c.conferir(dados, etiqueta))
     }
 
     fn cifra(&self) -> Option<&CifraPagina> {
@@ -555,14 +712,7 @@ impl<A: Arquivo> Paginador<A> {
         if lidos < dados.len() {
             return Err(ErroArmazenamento::PaginaCorrompida(numero));
         }
-        if let Some(cifra) = self.cifra() {
-            // Gravação cortada por queda também cai aqui: para quem lê é igual a adulterada.
-            cifra
-                .decifrar(numero, crate::VERSAO_FORMATO, &mut dados)
-                .map_err(|_| ErroArmazenamento::PaginaCorrompida(numero))?;
-            dados = dados[TAMANHO_NONCE..dados.len() - TAMANHO_TAG].into();
-        }
-        let pagina = Arc::new(Pagina::de_bytes(dados, numero)?);
+        let pagina = Arc::new(self.do_disco(numero, dados)?);
         self.travar_cache().inserir(numero, Arc::clone(&pagina));
         Ok(pagina)
     }
@@ -572,18 +722,8 @@ impl<A: Arquivo> Paginador<A> {
         numero: NumeroPagina,
         mut pagina: Pagina,
     ) -> Resultado<()> {
-        let resultado = match self.cifra() {
-            None => self
-                .arquivo
-                .gravar_em(self.posicao(numero), pagina.selar(numero)),
-            Some(cifra) => {
-                let mut disco = vec![0u8; self.tamanho.bytes()];
-                disco[TAMANHO_NONCE..TAMANHO_NONCE + self.util]
-                    .copy_from_slice(pagina.selar(numero));
-                cifra.cifrar(numero, crate::VERSAO_FORMATO, &mut disco)?;
-                self.arquivo.gravar_em(self.posicao(numero), &disco)
-            }
-        };
+        let disco = self.para_disco(numero, &mut pagina)?;
+        let resultado = self.arquivo.gravar_em(self.posicao(numero), &disco);
         self.gravacoes.fetch_add(1, Ordering::Relaxed);
         let mut cache = self.travar_cache();
         match resultado {
@@ -805,6 +945,47 @@ mod testes {
                 p.ler(4),
                 Err(ErroArmazenamento::PaginaInexistente(4))
             ));
+        }
+    }
+
+    #[test]
+    fn segundo_dono_recebe_em_uso() {
+        let vfs = disco(1);
+        let p = criar(&vfs, TamanhoPagina::K4, 4, false);
+        assert!(matches!(
+            Pag::abrir(&vfs, &caminho(), 4),
+            Err(ErroArmazenamento::Vfs(siouxdb_vfs::ErroVfs::EmUso(_)))
+        ));
+        assert_ne!(p.id_arquivo(), [0; crate::TAMANHO_ID]);
+        let id = p.id_arquivo();
+        drop(p);
+        assert_eq!(abrir(&vfs, 4, false).id_arquivo(), id);
+    }
+
+    #[test]
+    fn meta_e_formato_de_disco() {
+        for cifrado in [false, true] {
+            let vfs = disco(1);
+            let p = criar(&vfs, TamanhoPagina::K4, 4, cifrado);
+            let mut pg = com_texto(&p, TipoPagina::NoArvore, b"via wal");
+            let bytes = p.para_disco(5, &mut pg).unwrap();
+            assert_eq!(bytes.len(), 4096);
+            assert!(p.do_disco(6, bytes.clone().into()).is_err());
+            p.gravar_do_disco(5, &bytes).unwrap();
+            let m = Meta {
+                total_paginas: 6,
+                primeira_livre: 0,
+                raiz_catalogo: 5,
+                raiz_razao: 0,
+                ultimo_lsn: 9,
+            };
+            assert_eq!(Meta::decodificar(&m.codificar()), m);
+            p.definir_meta(m).unwrap();
+            p.confirmar().unwrap();
+            drop(p);
+            let p = abrir(&vfs, 4, cifrado);
+            assert_eq!(p.meta(), m);
+            assert_eq!(texto(&p.ler(5).unwrap(), 7), b"via wal");
         }
     }
 

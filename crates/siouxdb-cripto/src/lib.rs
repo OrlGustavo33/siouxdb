@@ -251,6 +251,11 @@ impl CifraPagina {
     }
 }
 
+/// Preenche `destino` com bytes aleatórios do sistema operacional.
+pub fn bytes_aleatorios(destino: &mut [u8]) -> Resultado<()> {
+    aleatorio(destino)
+}
+
 fn aleatorio(destino: &mut [u8]) -> Resultado<()> {
     getrandom::fill(destino).map_err(|_| ErroCripto::SemAleatorio)
 }

@@ -18,7 +18,8 @@
 ## Estado da implementação (22/11/2026)
 - ✅ Arquivo cifrado por página (XChaCha20-Poly1305), AAD com número da página e versão; senha por Argon2id; chave do arquivo em envelope; cabeçalho autenticado; chaves apagadas da memória (`zeroize`); mensagens de erro não dizem se foi a senha ou adulteração.
 - ⏳ Reversão de página para versão antiga da mesma posição: detectada só com a cadeia de hashes (M6).
-- ⏳ Trava de arquivo (dois processos abrindo o mesmo banco): M3.
+- ✅ Trava de arquivo: dois processos (ou duas aberturas) não usam o mesmo banco ao mesmo tempo.
+- ✅ WAL: confirmação com autenticação no banco cifrado; WAL alterado sem a chave não abre; WAL de outro banco é ignorado.
 - ⏳ `mlock` das chaves, chave por coluna e por titular: M7.
 
 ## Fora do escopo

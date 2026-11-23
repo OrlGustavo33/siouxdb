@@ -10,6 +10,8 @@
 //! parâmetros da senha é detectado.
 //!
 //! Cada cópia ocupa 512 bytes (um setor), com CRC32C no final.
+//! Bytes: 0..64 dados gerais, 64..168 proteção por senha, 168..184 identificador do
+//! arquivo, 184..224 autenticação, 508..512 CRC32C.
 
 use crate::{
     ErroArmazenamento, MAGICA, NumeroPagina, PAGINAS_RESERVADAS, Resultado, TamanhoPagina,
@@ -26,7 +28,10 @@ const POS_CIFRA: usize = 64;
 const POS_PARAMETROS: usize = 68;
 const POS_SAL: usize = 80;
 const POS_EMBRULHADA: usize = POS_SAL + TAMANHO_SAL; // 96
-const FIM_AUTENTICADO: usize = POS_EMBRULHADA + TAMANHO_EMBRULHADA; // 168
+const POS_ID: usize = POS_EMBRULHADA + TAMANHO_EMBRULHADA; // 168
+/// Bytes do identificador do arquivo.
+pub const TAMANHO_ID: usize = 16;
+const FIM_AUTENTICADO: usize = POS_ID + TAMANHO_ID; // 184
 const POS_AUTENTICACAO: usize = FIM_AUTENTICADO;
 
 /// Dados da proteção por senha guardados no cabeçalho.
@@ -59,6 +64,9 @@ pub struct Cabecalho {
     pub ultimo_lsn: u64,
     /// Proteção por senha (`None` = arquivo em claro).
     pub protecao: Option<Protecao>,
+    /// Identificador sorteado na criação. O WAL guarda o mesmo: um WAL de outro banco
+    /// nunca é aplicado.
+    pub id_arquivo: [u8; TAMANHO_ID],
     /// Etiqueta de autenticação lida do disco (só arquivos cifrados).
     autenticacao: [u8; SOBRA_CIFRA],
 }
@@ -75,6 +83,7 @@ impl Cabecalho {
             raiz_razao: 0,
             ultimo_lsn: 0,
             protecao,
+            id_arquivo: [0; TAMANHO_ID],
             autenticacao: [0; SOBRA_CIFRA],
         }
     }
@@ -132,8 +141,9 @@ impl Cabecalho {
                 .copy_from_slice(&p.parametros.iteracoes.to_le_bytes());
             b[POS_PARAMETROS + 8..POS_SAL].copy_from_slice(&p.parametros.paralelismo.to_le_bytes());
             b[POS_SAL..POS_EMBRULHADA].copy_from_slice(&p.sal);
-            b[POS_EMBRULHADA..FIM_AUTENTICADO].copy_from_slice(&p.embrulhada);
+            b[POS_EMBRULHADA..POS_ID].copy_from_slice(&p.embrulhada);
         }
+        b[POS_ID..FIM_AUTENTICADO].copy_from_slice(&self.id_arquivo);
         b
     }
 
@@ -186,7 +196,7 @@ impl Cabecalho {
                 sal: b[POS_SAL..POS_EMBRULHADA]
                     .try_into()
                     .expect("tamanho do sal"),
-                embrulhada: b[POS_EMBRULHADA..FIM_AUTENTICADO]
+                embrulhada: b[POS_EMBRULHADA..POS_ID]
                     .try_into()
                     .expect("tamanho da chave"),
             }),
@@ -201,6 +211,7 @@ impl Cabecalho {
             raiz_razao: u64_em(48),
             ultimo_lsn: u64_em(56),
             protecao,
+            id_arquivo: b[POS_ID..FIM_AUTENTICADO].try_into().expect("16 bytes"),
             autenticacao: b[POS_AUTENTICACAO..POS_AUTENTICACAO + SOBRA_CIFRA]
                 .try_into()
                 .expect("40 bytes"),

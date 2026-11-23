@@ -8,5 +8,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+fs4 = { version = "0.13", features = ["sync"] }
+
 [lints]
 workspace = true

@@ -3,9 +3,10 @@
 
 use serde::Serialize;
 use siouxdb::armazenamento::{
-    PAGINAS_RESERVADAS, Paginador, ParametrosSenha, SenhaNova, TamanhoPagina, TipoPagina,
+    NumeroPagina, PAGINAS_RESERVADAS, ParametrosSenha, SenhaNova, TamanhoPagina, TipoPagina,
 };
 use siouxdb::metricas::{Coletor, FotoPainel, LimitesAlerta};
+use siouxdb::transacoes::{Banco, Config, ErroBanco};
 use siouxdb::vfs::{Vfs, VfsReal};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,10 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-type Pag = Paginador<<VfsReal as Vfs>::Arquivo>;
-
-/// Páginas guardadas em memória pelo Studio.
-const CACHE_PAGINAS: usize = 512;
+type Bd = Banco<<VfsReal as Vfs>::Arquivo>;
 
 /// De onde vêm os dados do painel.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -28,7 +26,7 @@ pub enum Origem {
     Demonstracao,
 }
 
-/// Dados do arquivo aberto.
+/// Dados do banco aberto.
 #[derive(Debug, Clone, Serialize)]
 pub struct Resumo {
     /// De onde vêm os dados.
@@ -41,12 +39,16 @@ pub struct Resumo {
     pub cifrado: bool,
     /// Total de páginas.
     pub paginas: u64,
-    /// Geração do cabeçalho.
-    pub geracao: u64,
-    /// Último LSN confirmado.
-    pub ultimo_lsn: u64,
-    /// Páginas liberadas aguardando a próxima confirmação.
-    pub liberadas_pendentes: usize,
+    /// LSN da última confirmação.
+    pub lsn: u64,
+    /// LSN até onde o arquivo principal já recebeu o WAL.
+    pub lsn_checkpoint: u64,
+    /// Páginas esperando no WAL.
+    pub paginas_wal: u64,
+    /// `fsync`s do WAL e confirmações nesta abertura (mostra a confirmação em grupo).
+    pub sincronizacoes: u64,
+    /// Confirmações nesta abertura.
+    pub confirmacoes: u64,
     /// Versão do motor.
     pub versao: &'static str,
 }
@@ -67,7 +69,7 @@ pub struct Verificacao {
 /// O que o painel recebe a cada segundo.
 #[derive(Debug, Clone, Serialize)]
 pub struct PainelResposta {
-    /// Arquivo aberto.
+    /// Banco aberto.
     pub resumo: Resumo,
     /// Indicadores, séries e alertas.
     pub foto: FotoPainel,
@@ -79,13 +81,13 @@ pub struct PainelResposta {
 
 struct Carga {
     parar: Arc<AtomicBool>,
-    tarefa: Option<JoinHandle<()>>,
+    tarefas: Vec<JoinHandle<()>>,
 }
 
 impl Drop for Carga {
     fn drop(&mut self) {
         self.parar.store(true, Ordering::Relaxed);
-        if let Some(t) = self.tarefa.take() {
+        for t in self.tarefas.drain(..) {
             let _ = t.join();
         }
     }
@@ -94,7 +96,7 @@ impl Drop for Carga {
 struct Sessao {
     origem: Origem,
     caminho: PathBuf,
-    paginador: Arc<Pag>,
+    banco: Arc<Bd>,
     coletor: Coletor,
     verificacao: Option<Verificacao>,
     carga: Option<Carga>,
@@ -106,18 +108,21 @@ impl Drop for Sessao {
         self.carga.take();
         if self.origem == Origem::Demonstracao {
             let _ = std::fs::remove_file(&self.caminho);
+            let mut wal = self.caminho.as_os_str().to_owned();
+            wal.push("-wal");
+            let _ = std::fs::remove_file(PathBuf::from(wal));
         }
     }
 }
 
-/// Estado do Studio (um arquivo aberto por vez).
+/// Estado do Studio (um banco aberto por vez).
 pub struct Studio {
     sessao: Mutex<Option<Sessao>>,
     limites: Mutex<LimitesAlerta>,
 }
 
 impl Studio {
-    /// Studio sem arquivo aberto.
+    /// Studio sem banco aberto.
     pub fn novo() -> Arc<Self> {
         Arc::new(Studio {
             sessao: Mutex::new(None),
@@ -143,7 +148,7 @@ impl Studio {
     /// Registra uma leitura no coletor da sessão aberta.
     pub fn coletar(&self) {
         if let Some(s) = self.travar().as_mut() {
-            let leitura = s.paginador.leitura_metricas();
+            let leitura = s.banco.leitura_metricas();
             s.coletor.registrar(leitura);
         }
     }
@@ -159,17 +164,21 @@ impl Studio {
             .clone()
     }
 
-    /// Abre um arquivo existente.
+    /// Abre um banco existente.
     pub fn abrir(&self, caminho: &str, senha: Option<&str>) -> Result<Resumo, String> {
         let caminho = caminho_valido(caminho)?;
+        if !caminho.exists() {
+            return Err(format!("o arquivo não existe: {}", caminho.display()));
+        }
         // O anterior só é fechado se este abrir: um erro não derruba o que estava aberto.
+        // (Se for o mesmo arquivo, a trava recusa: feche antes.)
         let senha = senha.filter(|s| !s.is_empty()).map(str::as_bytes);
-        let p = Pag::abrir_com(&VfsReal::novo(), &caminho, CACHE_PAGINAS, senha)
+        let b = Bd::abrir(&VfsReal::novo(), &caminho, senha, Config::default())
             .map_err(|e| e.to_string())?;
-        Ok(self.instalar(Origem::Arquivo, caminho, p, None))
+        Ok(self.instalar(Origem::Arquivo, caminho, Arc::new(b), None))
     }
 
-    /// Cria um arquivo novo (recusa se já existir). Com `senha`, cifrado; `None` = em claro.
+    /// Cria um banco novo (recusa se já existir). Com `senha`, cifrado; `None` = em claro.
     pub fn criar(&self, caminho: &str, kb: u32, senha: Option<&str>) -> Result<Resumo, String> {
         let caminho = caminho_valido(caminho)?;
         let tamanho = TamanhoPagina::de_bytes(kb.saturating_mul(1024))
@@ -183,66 +192,83 @@ impl Studio {
             senha: s.as_bytes(),
             parametros: ParametrosSenha::default(),
         });
-        let p = Pag::criar_com(&VfsReal::novo(), &caminho, tamanho, CACHE_PAGINAS, senha)
-            .map_err(|e| e.to_string())?;
-        Ok(self.instalar(Origem::Arquivo, caminho, p, None))
+        let b = Bd::criar(
+            &VfsReal::novo(),
+            &caminho,
+            tamanho,
+            senha,
+            Config::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(self.instalar(Origem::Arquivo, caminho, Arc::new(b), None))
     }
 
-    /// Cria um banco temporário e gera carga nele, para ver o painel funcionando.
+    /// Cria um banco temporário cifrado e gera carga nele (3 escritores e 2 leitores ao
+    /// mesmo tempo), para ver o painel funcionando.
     pub fn demonstracao(&self) -> Result<Resumo, String> {
         self.fechar();
         let caminho =
             std::env::temp_dir().join(format!("siouxdb-studio-demo-{}.sdb", std::process::id()));
         // O nome é só nosso (leva o PID): sobra de uma execução anterior pode ser apagada.
         let _ = std::fs::remove_file(&caminho);
-        // Cifrado como um banco de verdade (mede o custo real da cifra), com senha sorteada
-        // e Argon2id leve: o arquivo é temporário e apagado ao fechar.
+        let mut wal = caminho.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(PathBuf::from(wal));
         let senha = format!("demo-{}-{:?}", std::process::id(), Instant::now());
         let senha = SenhaNova {
             senha: senha.as_bytes(),
             parametros: ParametrosSenha::para_testes(),
         };
-        let p = Pag::criar_com(
-            &VfsReal::novo(),
-            &caminho,
-            TamanhoPagina::K4,
-            256,
-            Some(senha),
-        )
-        .map_err(|e| e.to_string())?;
-        let p = Arc::new(p);
+        let config = Config {
+            checkpoint_apos_paginas: 2000,
+            ..Config::default()
+        };
+        let b = Arc::new(
+            Bd::criar(
+                &VfsReal::novo(),
+                &caminho,
+                TamanhoPagina::K4,
+                Some(senha),
+                config,
+            )
+            .map_err(|e| e.to_string())?,
+        );
         let parar = Arc::new(AtomicBool::new(false));
-        let tarefa = {
-            let (p, parar) = (Arc::clone(&p), Arc::clone(&parar));
-            std::thread::Builder::new()
-                .name("carga-demonstracao".into())
-                .spawn(move || gerar_carga(&p, &parar))
-                .map_err(|e| e.to_string())?
-        };
-        let carga = Carga {
-            parar,
-            tarefa: Some(tarefa),
-        };
-        Ok(self.instalar_arc(Origem::Demonstracao, caminho, p, Some(carga)))
+        let vivas = Arc::new(Mutex::new(Vec::<NumeroPagina>::new()));
+        let mut tarefas = Vec::new();
+        for i in 0..5u64 {
+            let (b, parar, vivas) = (Arc::clone(&b), Arc::clone(&parar), Arc::clone(&vivas));
+            let nome = if i < 3 { "escritor" } else { "leitor" };
+            tarefas.push(
+                std::thread::Builder::new()
+                    .name(format!("demo-{nome}-{i}"))
+                    .spawn(move || {
+                        if i < 3 {
+                            escritor(&b, &parar, &vivas, i)
+                        } else {
+                            leitor(&b, &parar, &vivas, i)
+                        }
+                    })
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        let carga = Carga { parar, tarefas };
+        Ok(self.instalar(Origem::Demonstracao, caminho, b, Some(carga)))
     }
 
-    fn instalar(&self, origem: Origem, caminho: PathBuf, p: Pag, carga: Option<Carga>) -> Resumo {
-        self.instalar_arc(origem, caminho, Arc::new(p), carga)
-    }
-
-    fn instalar_arc(
+    fn instalar(
         &self,
         origem: Origem,
         caminho: PathBuf,
-        p: Arc<Pag>,
+        b: Arc<Bd>,
         carga: Option<Carga>,
     ) -> Resumo {
         let mut coletor = Coletor::novo(self.limites());
-        coletor.registrar(p.leitura_metricas());
+        coletor.registrar(b.leitura_metricas());
         let sessao = Sessao {
             origem,
             caminho,
-            paginador: p,
+            banco: b,
             coletor,
             verificacao: None,
             carga,
@@ -253,13 +279,13 @@ impl Studio {
         resumo
     }
 
-    /// Fecha o arquivo aberto (e para a demonstração, apagando o arquivo temporário).
+    /// Fecha o banco aberto (e para a demonstração, apagando os arquivos temporários).
     pub fn fechar(&self) {
         let antiga = self.travar().take();
         drop(antiga);
     }
 
-    /// Foto atual do painel, se houver arquivo aberto.
+    /// Foto atual do painel, se houver banco aberto.
     pub fn painel(&self) -> Option<PainelResposta> {
         let limites = self.limites();
         self.travar().as_ref().map(|s| PainelResposta {
@@ -270,24 +296,25 @@ impl Studio {
         })
     }
 
-    /// Lê e confere todas as páginas do arquivo aberto.
+    /// Lê e confere todas as páginas numa foto do banco (não para a carga).
     pub fn verificar(&self) -> Result<Verificacao, String> {
-        // Não segura a trava da sessão durante a leitura: o painel continua atualizando.
-        let p = self
+        let b = self
             .travar()
             .as_ref()
-            .map(|s| Arc::clone(&s.paginador))
-            .ok_or("nenhum arquivo aberto")?;
+            .map(|s| Arc::clone(&s.banco))
+            .ok_or("nenhum banco aberto")?;
         let inicio = Instant::now();
-        let total = p.cabecalho().total_paginas;
+        let leitura = b.ler().map_err(|e| e.to_string())?;
+        let total = leitura.meta().total_paginas;
         let mut problemas = Vec::new();
         for n in PAGINAS_RESERVADAS..total {
-            if let Err(e) = p.ler(n)
+            if let Err(e) = leitura.pagina(n)
                 && problemas.len() < 100
             {
                 problemas.push(e.to_string());
             }
         }
+        drop(leitura);
         let v = Verificacao {
             quando: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -298,7 +325,7 @@ impl Studio {
             duracao_ms: inicio.elapsed().as_millis() as u64,
         };
         if let Some(s) = self.travar().as_mut()
-            && Arc::ptr_eq(&s.paginador, &p)
+            && Arc::ptr_eq(&s.banco, &b)
         {
             s.verificacao = Some(v.clone());
         }
@@ -323,16 +350,20 @@ fn caminho_valido(caminho: &str) -> Result<PathBuf, String> {
 }
 
 fn resumo(s: &Sessao) -> Resumo {
-    let c = s.paginador.cabecalho();
+    let p = s.banco.paginador();
+    let est = s.banco.estatisticas();
+    let total = s.banco.ler().map(|l| l.meta().total_paginas).unwrap_or(0);
     Resumo {
         origem: s.origem.clone(),
         caminho: s.caminho.display().to_string(),
-        pagina_kb: c.tamanho_pagina.bytes() as u64 / 1024,
-        cifrado: s.paginador.cifrado(),
-        paginas: c.total_paginas,
-        geracao: c.geracao,
-        ultimo_lsn: c.ultimo_lsn,
-        liberadas_pendentes: s.paginador.estatisticas().liberadas_pendentes,
+        pagina_kb: p.tamanho_pagina().bytes() as u64 / 1024,
+        cifrado: p.cifrado(),
+        paginas: total,
+        lsn: est.lsn_escrito,
+        lsn_checkpoint: est.lsn_checkpoint,
+        paginas_wal: est.paginas_no_wal,
+        sincronizacoes: est.sincronizacoes,
+        confirmacoes: est.confirmacoes,
         versao: siouxdb::VERSAO,
     }
 }
@@ -353,68 +384,86 @@ impl Sorteio {
     }
 }
 
-/// Carga de demonstração: ondas de leitura e gravação com picos de vez em quando, sobre
-/// um arquivo que cresce até ~16 MiB e depois passa a reaproveitar páginas.
-fn gerar_carga(p: &Pag, parar: &AtomicBool) {
-    const LIMITE_PAGINAS: usize = 4000;
-    let mut sorteio = Sorteio(0x9E37_79B9_7F4A_7C15 ^ u64::from(std::process::id()));
-    let mut vivas: Vec<u64> = Vec::new();
+/// Pausa da onda: ~40 s entre carga alta e baixa, com picos raros.
+fn pausa(inicio: Instant, sorteio: &mut Sorteio) -> Duration {
+    let t = inicio.elapsed().as_secs_f64();
+    let onda = 0.5 + 0.5 * (t * std::f64::consts::TAU / 40.0).sin();
+    if sorteio.ate(300) == 0 {
+        return Duration::ZERO; // pico
+    }
+    Duration::from_micros((1_000.0 + 14_000.0 * (1.0 - onda)) as u64)
+}
+
+/// Escritor da demonstração: transações de 1 a 6 operações, banco limitado a ~16 MiB.
+fn escritor(b: &Bd, parar: &AtomicBool, vivas: &Mutex<Vec<NumeroPagina>>, id: u64) {
+    const LIMITE: usize = 4000;
+    let mut sorteio = Sorteio(0x9E37_79B9_7F4A_7C15 ^ (id + 1).wrapping_mul(0xA24B_AED4_963E_E407));
     let inicio = Instant::now();
-    let mut desde_confirmar = 0u32;
     while !parar.load(Ordering::Relaxed) {
-        let t = inicio.elapsed().as_secs_f64();
-        // Onda de ~40 s entre 300 e 3.000 operações por fatia de 50 ms, com pico raro.
-        let onda = 0.5 + 0.5 * (t * std::f64::consts::TAU / 40.0).sin();
-        let pico = if sorteio.ate(200) == 0 { 4.0 } else { 1.0 };
-        let ops = ((15.0 + 135.0 * onda) * pico) as u32;
-        let fatia = Instant::now();
-        for _ in 0..ops {
-            let r = sorteio.ate(100);
-            let resultado = if r < 25 || vivas.len() < 64 {
-                if vivas.len() >= LIMITE_PAGINAS {
-                    let i = sorteio.ate(vivas.len() as u64) as usize;
-                    let n = vivas.swap_remove(i);
-                    p.liberar(n).map(|_| ())
-                } else {
-                    p.alocar(TipoPagina::NoArvore).and_then(|n| {
-                        let mut pag = p.pagina_nova(TipoPagina::NoArvore);
-                        let marca = sorteio.proximo().to_le_bytes();
-                        pag.conteudo_mut()[..8].copy_from_slice(&marca);
-                        vivas.push(n);
-                        p.gravar(n, pag)
-                    })
-                }
-            } else if r < 97 {
-                // Leituras concentradas nas páginas mais novas (cache acerta a maioria).
-                let tam = vivas.len() as u64;
-                let quente = sorteio.ate(10) < 8;
-                let i = if quente {
+        let Ok(mut tx) = b.escrever_esperando(Duration::from_secs(2)) else {
+            continue;
+        };
+        let mut lista = vivas.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut ok = true;
+        for _ in 0..1 + sorteio.ate(6) {
+            let r = sorteio.ate(10);
+            let res = if lista.len() < 64 || (r < 4 && lista.len() < LIMITE) {
+                tx.alocar(TipoPagina::NoArvore).and_then(|n| {
+                    let mut p = tx.pagina_nova(TipoPagina::NoArvore);
+                    p.conteudo_mut()[..8].copy_from_slice(&sorteio.proximo().to_le_bytes());
+                    lista.push(n);
+                    tx.gravar(n, p)
+                })
+            } else if r < 9 {
+                let n = lista[sorteio.ate(lista.len() as u64) as usize];
+                let marca = sorteio.proximo().to_le_bytes();
+                tx.pagina_mut(n)
+                    .map(|p| p.conteudo_mut()[..8].copy_from_slice(&marca))
+            } else {
+                let i = sorteio.ate(lista.len() as u64) as usize;
+                let n = lista.swap_remove(i);
+                tx.liberar(n)
+            };
+            if res.is_err() {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            // A lista compartilhada muda junto com a confirmação (ainda com a vez de escrever).
+            *vivas.lock().unwrap_or_else(|e| e.into_inner()) = lista;
+            if matches!(tx.confirmar(), Err(ErroBanco::Falhou)) {
+                return;
+            }
+        } else {
+            tx.desfazer();
+        }
+        std::thread::sleep(pausa(inicio, &mut sorteio));
+    }
+}
+
+/// Leitor da demonstração: abre uma foto e lê páginas, a maioria das mais novas.
+fn leitor(b: &Bd, parar: &AtomicBool, vivas: &Mutex<Vec<NumeroPagina>>, id: u64) {
+    let mut sorteio = Sorteio(0xD1B5_4A32_D192_ED03 ^ id);
+    let inicio = Instant::now();
+    while !parar.load(Ordering::Relaxed) {
+        let lista = vivas.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Ok(l) = b.ler()
+            && !lista.is_empty()
+        {
+            let tam = lista.len() as u64;
+            for _ in 0..20 {
+                let i = if sorteio.ate(10) < 8 {
                     tam - 1 - sorteio.ate(tam.min(200))
                 } else {
                     sorteio.ate(tam)
                 };
-                p.ler(vivas[i as usize]).map(|_| ())
-            } else {
-                let i = sorteio.ate(vivas.len() as u64) as usize;
-                let n = vivas.swap_remove(i);
-                p.liberar(n)
-            };
-            if resultado.is_err() {
-                return; // erro de disco: a demonstração para (o painel mostra o que houve até aqui)
-            }
-            desde_confirmar += 1;
-            if desde_confirmar >= 400 {
-                desde_confirmar = 0;
-                if p.confirmar().is_err() {
-                    return;
-                }
+                // Página criada depois da foto não existe nela: é esperado.
+                let _ = l.pagina(lista[i as usize]);
             }
         }
-        if let Some(resto) = Duration::from_millis(50).checked_sub(fatia.elapsed()) {
-            std::thread::sleep(resto);
-        }
+        std::thread::sleep(pausa(inicio, &mut sorteio) / 2);
     }
-    let _ = p.confirmar();
 }
 
 #[cfg(test)]
@@ -434,6 +483,7 @@ mod testes {
         assert!(studio.verificar().is_err());
         let arq = pasta().join("criar.sdb");
         let _ = std::fs::remove_file(&arq);
+        let _ = std::fs::remove_file(pasta().join("criar.sdb-wal"));
         let caminho = arq.display().to_string();
         assert!(studio.criar(&caminho, 3, None).is_err());
         assert!(studio.criar(&caminho, 16, Some("curta")).is_err());
@@ -443,6 +493,11 @@ mod testes {
         assert!(
             studio.criar(&caminho, 16, None).is_err(),
             "não pode criar por cima"
+        );
+        assert!(studio.abrir("/nao/existe.sdb", None).is_err());
+        assert!(
+            studio.painel().is_some(),
+            "erro ao abrir outro não fecha o atual"
         );
         studio.coletar();
         let v = studio.verificar().unwrap();
@@ -455,6 +510,9 @@ mod testes {
         assert_eq!(json["resumo"]["origem"], "arquivo");
         assert!(json["foto"]["series"]["operacoes_por_s"].is_array());
 
+        // Com o banco aberto, abrir o mesmo arquivo de novo é recusado pela trava.
+        let em_uso = studio.abrir(&caminho, Some("senha-de-teste")).unwrap_err();
+        assert!(em_uso.contains("em uso"), "{em_uso}");
         studio.fechar();
         assert!(studio.painel().is_none());
         let sem = studio.abrir(&caminho, None).unwrap_err();
@@ -470,6 +528,7 @@ mod testes {
         assert!(studio.abrir("  ", None).is_err());
         studio.fechar();
         std::fs::remove_file(&arq).unwrap();
+        let _ = std::fs::remove_file(pasta().join("criar.sdb-wal"));
     }
 
     #[test]
@@ -478,15 +537,18 @@ mod testes {
         let r = studio.demonstracao().unwrap();
         assert_eq!(r.origem, Origem::Demonstracao);
         assert!(r.cifrado);
-        std::thread::sleep(Duration::from_millis(600));
+        std::thread::sleep(Duration::from_millis(800));
         studio.coletar();
-        let foto = studio.painel().unwrap().foto;
+        let painel = studio.painel().unwrap();
+        let foto = painel.foto;
         assert!(
             foto.indicadores.operacoes_por_s > 0.0,
             "{:?}",
             foto.indicadores
         );
         assert!(foto.indicadores.latencia_p99_us.is_some());
+        assert!(painel.resumo.confirmacoes > 0);
+        assert!(painel.resumo.sincronizacoes <= painel.resumo.confirmacoes);
         let v = studio.verificar().unwrap();
         assert!(v.problemas.is_empty(), "{:?}", v.problemas);
         studio.definir_limites(LimitesAlerta {
@@ -509,5 +571,6 @@ mod testes {
             !Path::new(&r.caminho).exists(),
             "arquivo temporário deveria ter sido apagado"
         );
+        assert!(!Path::new(&format!("{}-wal", r.caminho)).exists());
     }
 }
