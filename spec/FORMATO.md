@@ -115,8 +115,31 @@ O CRC de cada quadro **continua** o do anterior (`crc32c(anterior ++ campos ++ c
 - O **checkpoint** copia para o arquivo principal a última versão de cada página até `min(LSN durável, foto mais antiga aberta)`, grava o cabeçalho (meta) e, se tudo foi copiado e nenhuma foto aberta é anterior ao checkpoint, reinicia o WAL (sal novo, sequência + 1). Roda sozinho a cada `checkpoint_apos_paginas` páginas, na vez de quem confirmou.
 - Uma queda no meio do checkpoint é segura: as páginas já copiadas também estão no WAL, que só é reiniciado depois de o cabeçalho principal estar em disco.
 
+## Tabelas (implementado no M4, `siouxdb-indices` + `siouxdb-catalogo`)
+
+Tipos de página novos: **3 nó de árvore**, **2 log quente**, **7 cabeçalho de tabela**.
+
+### Nó da árvore B+ (dentro do conteúdo da página)
+`0` nível (0 = folha) · `2..4` quantidade de células · `4..6` bytes das células · `6..8` bytes mortos · `8..16` filho da direita (nó interno) · `16..` vetor de posições (u16) · células gravadas do fim da página para o começo.
+- célula de folha: tamanho da chave u16 · tamanho do valor u16 · chave · valor;
+- célula de nó interno: tamanho da chave u16 · filho u64 · chave (o filho tem as chaves menores que ela).
+
+A raiz nunca muda de página. Chaves são comparadas como bytes; a separadora que sobe é o menor prefixo que separa as duas folhas.
+
+### Chaves e linhas
+- **Chave** (ordenável como bytes): por coluna, um byte de tipo (0 nulo, 1 booleano, 2 inteiro, 3 real, 4 texto, 5 bytes) e o valor — inteiro em big-endian com o bit de sinal invertido; real com o truque de bits do IEEE 754; texto e bytes com `00` → `00 FF` e terminador `00 00`.
+- **Linha**: quantidade u16 e, por valor, um byte de tipo e o valor em little-endian (texto/bytes com tamanho u32).
+
+### Log quente (livro-razão das versões)
+Página: `0..8` próxima página · `8..10` bytes usados · registros a partir do byte 16. Registro: tamanho u16 · marcas (bit 0 = remoção) · tamanho da chave u16 · versão anterior da mesma chave (ponteiro = página << 16 | posição) · LSN · instante (µs) · chave · linha. Nada é sobrescrito: cada gravação anexa uma versão.
+
+### Tabela e catálogo
+- Cabeçalho de tabela: raiz do índice, primeira e última página do log, versões, linhas (5 × u64).
+- O índice da chave primária leva à versão mais nova; remoção também é versão (o histórico continua alcançável).
+- Catálogo: árvore B+ na `raiz_catalogo` do cabeçalho do banco — `00 "proximo_id"` → contador; `01 + nome` → definição (id, nome, cabeçalho, colunas com tipo e não-nulo, posições da chave). `sys_tabelas` e `sys_colunas` são visões calculadas.
+
 ## Tipos de página (planejados)
-catálogo · log da camada quente · nó de B+tree · bloco frio em colunas · resumo de bloco · lista de páginas livres · ledger.
+bloco frio em colunas · resumo de bloco · ledger (os demais já existem).
 
 ## A definir antes da v0.1
 - Encadeamento de hashes do livro-razão (M6).

@@ -7,6 +7,7 @@
 //! sioux verificar <arquivo>
 //! sioux trocar-senha <arquivo>
 //! sioux checkpoint <arquivo>
+//! sioux tabelas <arquivo>
 //! ```
 //!
 //! Arquivos novos são **cifrados por padrão**. A senha é pedida no terminal (sem eco) ou
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
         ["verificar", arquivo] => verificar(arquivo),
         ["trocar-senha", arquivo] => trocar_senha(arquivo),
         ["checkpoint", arquivo] => checkpoint(arquivo),
+        ["tabelas", arquivo] => tabelas(arquivo),
         _ => {
             ajuda();
             return ExitCode::from(2);
@@ -274,5 +276,29 @@ fn checkpoint(arquivo: &str) -> Result<(), String> {
         antes.paginas_no_wal - depois.paginas_no_wal,
         depois.lsn_checkpoint
     );
+    Ok(())
+}
+
+fn tabelas(arquivo: &str) -> Result<(), String> {
+    let b = abrir(arquivo)?;
+    let l = b.ler().map_err(|e| e.to_string())?;
+    let linhas = siouxdb::catalogo::catalogo::sys_tabelas(&l).map_err(|e| e.to_string())?;
+    if linhas.is_empty() {
+        println!("nenhuma tabela");
+    }
+    for t in linhas {
+        let v: Vec<String> = t
+            .iter()
+            .map(|x| match x {
+                siouxdb::catalogo::Valor::Texto(s) => s.clone(),
+                siouxdb::catalogo::Valor::Inteiro(i) => i.to_string(),
+                outro => format!("{outro:?}"),
+            })
+            .collect();
+        println!(
+            "{:<24} id {:<4} colunas {:<3} linhas {:<10} versões {}",
+            v[0], v[1], v[2], v[3], v[4]
+        );
+    }
     Ok(())
 }

@@ -1,0 +1,20 @@
+[package]
+name = "siouxdb-catalogo"
+description = "Tabelas do SiouxDB: valores e chaves ordenáveis, log da camada quente (livro-razão de versões), tabela versionada com índice da chave primária e catálogo do sistema."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+siouxdb-armazenamento.workspace = true
+siouxdb-transacoes.workspace = true
+siouxdb-indices.workspace = true
+
+[dev-dependencies]
+siouxdb-vfs.workspace = true
+
+[lints]
+workspace = true

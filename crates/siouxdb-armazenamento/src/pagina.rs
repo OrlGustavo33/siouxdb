@@ -32,6 +32,8 @@ pub enum TipoPagina {
     Resumo = 5,
     /// Livro-razão (cadeia de hashes, pontos de controle).
     Razao = 6,
+    /// Cabeçalho de uma tabela (raiz do índice, pontas do log, contagens).
+    CabecalhoTabela = 7,
 }
 
 impl TipoPagina {
@@ -44,6 +46,7 @@ impl TipoPagina {
             4 => TipoPagina::BlocoFrio,
             5 => TipoPagina::Resumo,
             6 => TipoPagina::Razao,
+            7 => TipoPagina::CabecalhoTabela,
             _ => return None,
         })
     }

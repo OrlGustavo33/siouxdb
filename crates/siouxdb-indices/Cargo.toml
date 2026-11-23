@@ -1,0 +1,16 @@
+[package]
+name = "siouxdb-indices"
+description = "Índices do SiouxDB: árvore B+ em páginas, com chaves e valores de tamanho variável, cursor por faixa e verificador de estrutura."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+siouxdb-armazenamento.workspace = true
+siouxdb-transacoes.workspace = true
+
+[lints]
+workspace = true

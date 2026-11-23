@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 exclude = ["studio"]
-members = ["crates/siouxdb-vfs", "crates/siouxdb-armazenamento", "crates/siouxdb-metricas", "crates/siouxdb-cripto", "crates/siouxdb-transacoes", "crates/siouxdb", "crates/siouxdb-cli"]
+members = ["crates/siouxdb-vfs", "crates/siouxdb-armazenamento", "crates/siouxdb-metricas", "crates/siouxdb-cripto", "crates/siouxdb-transacoes", "crates/siouxdb-indices", "crates/siouxdb-catalogo", "crates/siouxdb", "crates/siouxdb-cli"]
 
 [workspace.package]
 version = "0.0.1"
@@ -24,6 +24,8 @@ siouxdb-vfs = { path = "crates/siouxdb-vfs", version = "0.0.1" }
 siouxdb-armazenamento = { path = "crates/siouxdb-armazenamento", version = "0.0.1" }
 siouxdb-cripto = { path = "crates/siouxdb-cripto", version = "0.0.1" }
 siouxdb-transacoes = { path = "crates/siouxdb-transacoes", version = "0.0.1" }
+siouxdb-indices = { path = "crates/siouxdb-indices", version = "0.0.1" }
+siouxdb-catalogo = { path = "crates/siouxdb-catalogo", version = "0.0.1" }
 siouxdb-metricas = { path = "crates/siouxdb-metricas", version = "0.0.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

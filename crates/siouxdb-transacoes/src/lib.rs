@@ -21,7 +21,9 @@ mod erro;
 mod fila;
 mod wal;
 
-pub use banco::{Banco, Config, EstatisticasBanco, Leitura, Sincronia, Transacao};
+pub use banco::{
+    Banco, Config, EstatisticasBanco, Leitura, Paginas, PaginasMut, Sincronia, Transacao,
+};
 pub use erro::{ErroBanco, Resultado};
 
 #[cfg(test)]

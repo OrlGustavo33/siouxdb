@@ -5,7 +5,8 @@
 //!
 //! **Estado: pré-alfa.** Hoje existem a camada de disco ([`vfs`]), o armazenamento em
 //! páginas verificadas e cifradas ([`armazenamento`]) e as transações com WAL
-//! ([`transacoes`]). Ainda não há SQL. O caminho até a v0.1
+//! ([`transacoes`]), a árvore B+ ([`indices`]) e as tabelas com catálogo ([`catalogo`]).
+//! Ainda não há SQL. O caminho até a v0.1
 //! está em `docs/PLANO_IMPLEMENTACAO.md`. Não use para guardar dados reais.
 
 /// Camada de acesso a disco (real e simulada).
@@ -16,6 +17,12 @@ pub use siouxdb_armazenamento as armazenamento;
 
 /// Transações: WAL, escritor único com fila justa, confirmação em grupo, leitores com foto.
 pub use siouxdb_transacoes as transacoes;
+
+/// Índices: árvore B+ em páginas.
+pub use siouxdb_indices as indices;
+
+/// Tabelas versionadas (log quente + índice da chave primária) e catálogo `sys_*`.
+pub use siouxdb_catalogo as catalogo;
 
 /// Contadores, histogramas e o coletor do painel em tempo real.
 pub use siouxdb_metricas as metricas;

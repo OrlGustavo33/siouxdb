@@ -76,13 +76,15 @@ Só o motor é obrigatório; o resto é opcional. Embutido (como o SQLite) ou se
 | v0.4 | Análise e desempenho: colunas, índices adaptativo e aprendido, perfis e ajuste automático |
 | v0.5+ | Cluster com Raft e IA local |
 
-**Feito até agora (M0 a M3):**
+**Feito até agora (M0 a M4):**
 - workspace e CI em Linux, macOS e Windows;
 - `siouxdb-vfs`: disco real e disco simulado. O simulado reproduz queda de energia com gravações perdidas ou cortadas no meio de um setor, de forma determinística por semente;
 - `siouxdb-armazenamento`: páginas com verificação (CRC32C + número da página), cabeçalho em duas cópias alternadas, cache SIEVE e paginador. Testado com centenas de quedas simuladas: nunca aceita página misturada;
 - `siouxdb-cripto`: arquivo **cifrado por padrão** — cada página com XChaCha20-Poly1305 (página trocada de lugar ou alterada não decifra), senha por Argon2id, chave do arquivo em envelope (trocar a senha não recifra nada) e cabeçalho autenticado. Os testes de queda de energia rodam também com cifra;
 - `siouxdb-transacoes`: **WAL** com CRC encadeado, transações **tudo ou nada**, um escritor por vez em **fila justa**, **confirmação em grupo**, leitores com **foto** que nunca esperam, checkpoint automático e **trava de arquivo**. Sincronia configurável (`Total`: nada confirmado se perde; `Normal`: mais rápido). Testado com um modelo que roda transações e quedas de energia aleatórias nos quatro modos (claro/cifrado × Total/Normal);
-- comando `sioux criar | info | verificar | trocar-senha | checkpoint`.
+- `siouxdb-indices`: **árvore B+** em páginas (chaves de tamanho variável, separadora curta, cursor por faixa, verificador de estrutura), testada contra o `BTreeMap` do Rust com milhares de operações aleatórias;
+- `siouxdb-catalogo`: **tabelas versionadas** — a camada quente é um livro-razão onde toda gravação anexa uma versão; índice da chave primária; histórico por linha e leitura **como estava no LSN tal**; catálogo com `sys_tabelas` e `sys_colunas`;
+- comando `sioux criar | info | verificar | trocar-senha | checkpoint | tabelas`.
 - `siouxdb-metricas`: histograma sem trava, séries de 60 s e alertas configuráveis;
 - **SiouxDB Studio** (`studio/`, Tauri): painel de monitoramento em tempo real sobre um arquivo ou uma demonstração com carga gerada.
 
@@ -97,6 +99,15 @@ Banco **cifrado**, páginas de 8 KiB, cada transação altera 1 página, 2 leito
 | Total | 32 | 4.115 | 15,1 | 7,3 / 23,1 ms |
 | Normal | 1 | 7.788 | 205 | 0,07 / 0,18 ms |
 | Normal | 8 | 6.291 | 208 | 0,85 / 9,4 ms |
+
+Tabela com 1 milhão de linhas (3 colunas, inseridas em ordem embaralhada, lotes de 10 mil por transação), `cargo run --release -p siouxdb-catalogo --example linhas -- 1000000 <pasta> <cache>`:
+
+| Cache | Inserir | Buscar pela chave (frio / quente) | Varrer |
+|---|---|---|---|
+| 1.024 páginas (8 MiB, padrão) | 24,8 mil/s | 13,8 mil/s / 14,1 mil/s | 28,8 mil linhas/s |
+| 20.000 páginas (160 MiB) | 25,1 mil/s | 200 mil/s / 431 mil/s | 1,38 milhão linhas/s |
+
+Arquivo de 116 MiB, índice com 3 níveis. Com cache menor que o banco, cada página que sai do cache precisa ser lida e decifrada de novo; o cache padrão vai ganhar ajuste automático no M8.
 
 Na sincronia Total o limite é o `fsync` do disco; a confirmação em grupo é o que faz o número subir com mais escritores. Ainda não há comparação com SQLite (fica para o M8, com o mesmo roteiro de carga).
 

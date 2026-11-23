@@ -620,6 +620,11 @@ impl<A: Arquivo> Leitura<'_, A> {
     pub fn pagina(&self, numero: NumeroPagina) -> Resultado<Arc<Pagina>> {
         self.banco.pagina_em(self.lsn, &self.meta, numero)
     }
+
+    /// Bytes de conteúdo de cada página deste banco.
+    pub fn tamanho_conteudo(&self) -> usize {
+        self.banco.paginador.tamanho_util() - siouxdb_armazenamento::CABECALHO_PAGINA
+    }
 }
 
 impl<A: Arquivo> Drop for Leitura<'_, A> {
@@ -636,7 +641,7 @@ pub struct Transacao<'a, A: Arquivo> {
     base_lsn: u64,
     meta: Meta,
     meta_inicial: Meta,
-    sujas: BTreeMap<NumeroPagina, Pagina>,
+    sujas: BTreeMap<NumeroPagina, Arc<Pagina>>,
 }
 
 impl<A: Arquivo> Transacao<'_, A> {
@@ -650,21 +655,34 @@ impl<A: Arquivo> Transacao<'_, A> {
         self.banco.paginador.pagina_nova(tipo)
     }
 
-    /// Lê uma página como esta transação vê (com as mudanças dela).
-    pub fn pagina(&self, numero: NumeroPagina) -> Resultado<Pagina> {
-        if let Some(p) = self.sujas.get(&numero) {
-            return Ok(p.clone());
-        }
-        Ok((*self.banco.pagina_em(self.base_lsn, &self.meta, numero)?).clone())
+    /// LSN que esta transação vai receber ao confirmar.
+    pub fn lsn(&self) -> u64 {
+        self.base_lsn + 1
     }
 
-    /// Página para alterar no lugar (traz para a transação se ainda não estiver).
+    /// Bytes de conteúdo de cada página deste banco.
+    pub fn tamanho_conteudo(&self) -> usize {
+        self.banco.paginador.tamanho_util() - siouxdb_armazenamento::CABECALHO_PAGINA
+    }
+
+    /// Lê uma página como esta transação vê (com as mudanças dela). Não copia a página.
+    pub fn pagina(&self, numero: NumeroPagina) -> Resultado<Arc<Pagina>> {
+        if let Some(p) = self.sujas.get(&numero) {
+            return Ok(Arc::clone(p));
+        }
+        self.banco.pagina_em(self.base_lsn, &self.meta, numero)
+    }
+
+    /// Página para alterar no lugar (traz para a transação se ainda não estiver; a cópia
+    /// acontece uma vez por página por transação).
     pub fn pagina_mut(&mut self, numero: NumeroPagina) -> Resultado<&mut Pagina> {
         if !self.sujas.contains_key(&numero) {
-            let p = self.pagina(numero)?;
+            let p = self.banco.pagina_em(self.base_lsn, &self.meta, numero)?;
             self.sujas.insert(numero, p);
         }
-        Ok(self.sujas.get_mut(&numero).expect("inserida acima"))
+        Ok(Arc::make_mut(
+            self.sujas.get_mut(&numero).expect("inserida acima"),
+        ))
     }
 
     /// Troca a página inteira.
@@ -682,7 +700,7 @@ impl<A: Arquivo> Transacao<'_, A> {
                 .into(),
             );
         }
-        self.sujas.insert(numero, pagina);
+        self.sujas.insert(numero, Arc::new(pagina));
         Ok(())
     }
 
@@ -703,7 +721,7 @@ impl<A: Arquivo> Transacao<'_, A> {
             self.meta.total_paginas += 1;
             n
         };
-        self.sujas.insert(n, self.pagina_nova(tipo));
+        self.sujas.insert(n, Arc::new(self.pagina_nova(tipo)));
         Ok(n)
     }
 
@@ -714,7 +732,7 @@ impl<A: Arquivo> Transacao<'_, A> {
         }
         let mut livre = self.pagina_nova(TipoPagina::Livre);
         livre.conteudo_mut()[..8].copy_from_slice(&self.meta.primeira_livre.to_le_bytes());
-        self.sujas.insert(numero, livre);
+        self.sujas.insert(numero, Arc::new(livre));
         self.meta.primeira_livre = numero;
         Ok(())
     }
@@ -751,7 +769,8 @@ impl<A: Arquivo> Transacao<'_, A> {
             self.sujas.len() * (TAMANHO_QUADRO + tam) + TAMANHO_QUADRO + TAMANHO_CONFIRMACAO,
         );
         let mut novas = Vec::with_capacity(self.sujas.len());
-        for (n, mut p) in std::mem::take(&mut self.sujas) {
+        for (n, p) in std::mem::take(&mut self.sujas) {
+            let mut p = Arc::try_unwrap(p).unwrap_or_else(|compartilhada| (*compartilhada).clone());
             p.definir_lsn(lsn);
             let disco = banco.paginador.para_disco(n, &mut p)?;
             let pos = m.quadro(&wal::campos_quadro(TIPO_PAGINA, n, lsn, sal), &disco);
@@ -835,5 +854,72 @@ impl<A: Arquivo> Banco<A> {
     pub(crate) fn checkpoint_pela_metade(&self) -> Resultado<()> {
         let vez = self.fila.adquirir(self.config.espera_maxima_escritor)?;
         self.checkpoint_com_vez(&vez, true)
+    }
+}
+
+/// Quem sabe ler páginas: uma [`Leitura`] (foto) ou uma [`Transacao`] (com as mudanças dela).
+/// As estruturas de cima (árvores, tabelas, catálogo) leem só por aqui.
+pub trait Paginas {
+    /// Lê uma página, sem copiar.
+    fn pagina(&self, numero: NumeroPagina) -> Resultado<Arc<Pagina>>;
+    /// Estado lógico (total de páginas, raízes).
+    fn meta(&self) -> Meta;
+    /// Bytes de conteúdo de cada página.
+    fn tamanho_conteudo(&self) -> usize;
+}
+
+/// Quem também sabe alterar páginas: uma [`Transacao`].
+pub trait PaginasMut: Paginas {
+    /// Página para alterar no lugar.
+    fn pagina_mut(&mut self, numero: NumeroPagina) -> Resultado<&mut Pagina>;
+    /// Reserva uma página zerada do tipo dado.
+    fn alocar(&mut self, tipo: TipoPagina) -> Resultado<NumeroPagina>;
+    /// Devolve uma página para a lista de livres.
+    fn liberar(&mut self, numero: NumeroPagina) -> Resultado<()>;
+    /// LSN que as mudanças vão receber ao confirmar.
+    fn lsn(&self) -> u64;
+    /// Define a raiz do catálogo.
+    fn definir_raiz_catalogo(&mut self, numero: NumeroPagina);
+}
+
+impl<A: Arquivo> Paginas for Leitura<'_, A> {
+    fn pagina(&self, numero: NumeroPagina) -> Resultado<Arc<Pagina>> {
+        Leitura::pagina(self, numero)
+    }
+    fn meta(&self) -> Meta {
+        Leitura::meta(self)
+    }
+    fn tamanho_conteudo(&self) -> usize {
+        Leitura::tamanho_conteudo(self)
+    }
+}
+
+impl<A: Arquivo> Paginas for Transacao<'_, A> {
+    fn pagina(&self, numero: NumeroPagina) -> Resultado<Arc<Pagina>> {
+        Transacao::pagina(self, numero)
+    }
+    fn meta(&self) -> Meta {
+        Transacao::meta(self)
+    }
+    fn tamanho_conteudo(&self) -> usize {
+        Transacao::tamanho_conteudo(self)
+    }
+}
+
+impl<A: Arquivo> PaginasMut for Transacao<'_, A> {
+    fn pagina_mut(&mut self, numero: NumeroPagina) -> Resultado<&mut Pagina> {
+        Transacao::pagina_mut(self, numero)
+    }
+    fn alocar(&mut self, tipo: TipoPagina) -> Resultado<NumeroPagina> {
+        Transacao::alocar(self, tipo)
+    }
+    fn liberar(&mut self, numero: NumeroPagina) -> Resultado<()> {
+        Transacao::liberar(self, numero)
+    }
+    fn lsn(&self) -> u64 {
+        Transacao::lsn(self)
+    }
+    fn definir_raiz_catalogo(&mut self, numero: NumeroPagina) {
+        Transacao::definir_raiz_catalogo(self, numero);
     }
 }

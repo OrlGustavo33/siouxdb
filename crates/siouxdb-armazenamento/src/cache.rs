@@ -240,6 +240,26 @@ mod testes {
     }
 
     #[test]
+    fn nao_descarta_enquanto_cabe() {
+        let mut c = CacheSieve::novo(100);
+        let mut x = 1u64;
+        for _ in 0..100_000 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let k = (x >> 33) % 60;
+            if c.obter(&k).is_none() {
+                c.inserir(k, k);
+            }
+            if (x >> 20) % 50 == 0 {
+                c.remover(&((x >> 40) % 60));
+            }
+            assert!(c.len() <= 60);
+        }
+        assert_eq!(c.estatisticas().descartes, 0, "{:?}", c.estatisticas());
+    }
+
+    #[test]
     fn remover_e_limpar_mantem_a_fila_coerente() {
         let mut c = CacheSieve::novo(4);
         for i in 0..4 {

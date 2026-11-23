@@ -21,6 +21,8 @@ siouxdb-vfs.workspace = true
 siouxdb-armazenamento.workspace = true
 siouxdb-metricas.workspace = true
 siouxdb-transacoes.workspace = true
+siouxdb-indices.workspace = true
+siouxdb-catalogo.workspace = true
 
 [lints]
 workspace = true
