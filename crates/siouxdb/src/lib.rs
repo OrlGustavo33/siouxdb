@@ -32,3 +32,30 @@ pub const VERSAO: &str = env!("CARGO_PKG_VERSION");
 
 /// Versão do formato de arquivo que esta biblioteca grava. Zero = ainda instável.
 pub const VERSAO_FORMATO: u32 = siouxdb_armazenamento::VERSAO_FORMATO;
+
+/// Banco num arquivo do disco de verdade (o tipo que um programa normalmente usa).
+pub type BancoArquivo = transacoes::Banco<<vfs::VfsReal as vfs::Vfs>::Arquivo>;
+
+/// Abre o banco em `caminho`, ou cria se não existir (cifrado se `senha` vier; páginas de
+/// 8 KiB; senha com o custo padrão do Argon2id).
+pub fn abrir_ou_criar(
+    caminho: &std::path::Path,
+    senha: Option<&[u8]>,
+    config: transacoes::Config,
+) -> transacoes::Resultado<BancoArquivo> {
+    let vfs = vfs::VfsReal::novo();
+    if caminho.exists() {
+        return BancoArquivo::abrir(&vfs, caminho, senha, config);
+    }
+    let senha = senha.map(|s| armazenamento::SenhaNova {
+        senha: s,
+        parametros: armazenamento::ParametrosSenha::default(),
+    });
+    BancoArquivo::criar(
+        &vfs,
+        caminho,
+        armazenamento::TamanhoPagina::K8,
+        senha,
+        config,
+    )
+}

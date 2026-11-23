@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["studio"]
+exclude = ["studio", "exemplos/microservico"]
 members = ["crates/siouxdb-vfs", "crates/siouxdb-armazenamento", "crates/siouxdb-metricas", "crates/siouxdb-cripto", "crates/siouxdb-transacoes", "crates/siouxdb-indices", "crates/siouxdb-catalogo", "crates/siouxdb", "crates/siouxdb-cli"]
 
 [workspace.package]

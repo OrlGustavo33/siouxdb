@@ -7,3 +7,4 @@
 .vscode/
 studio/src-tauri/target
 studio/src-tauri/gen
+exemplos/microservico/target

@@ -73,3 +73,20 @@ jobs:
       - name: Sintaxe da interface
         working-directory: studio/ui
         run: node --check app.js
+
+  microservico:
+    name: microserviço de exemplo
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: exemplos/microservico
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: exemplos/microservico
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets

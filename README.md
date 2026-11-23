@@ -111,6 +111,10 @@ Arquivo de 116 MiB, índice com 3 níveis. Com cache menor que o banco, cada pá
 
 Na sincronia Total o limite é o `fsync` do disco; a confirmação em grupo é o que faz o número subir com mais escritores. Ainda não há comparação com SQLite (fica para o M8, com o mesmo roteiro de carga).
 
+## Usar hoje (embutido)
+
+Ainda não há SQL, mas dá para usar o SiouxDB num programa Rust pela API de tabelas (`siouxdb::abrir_ou_criar` + `siouxdb::catalogo`). O exemplo [`exemplos/microservico`](exemplos/microservico) é uma API HTTP/JSON completa (tabelas, inserir/gravar/remover, faixa, histórico e leitura por LSN) com token obrigatório.
+
 ## Compilar e testar
 
 ```bash
