@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 siouxdb-vfs.workspace = true
+siouxdb-metricas.workspace = true
 
 [lints]
 workspace = true

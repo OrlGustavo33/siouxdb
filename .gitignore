@@ -5,3 +5,5 @@
 .DS_Store
 .idea/
 .vscode/
+studio/src-tauri/target
+studio/src-tauri/gen

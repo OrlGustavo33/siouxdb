@@ -11,9 +11,15 @@ readme = "../../README.md"
 keywords = ["database", "embedded", "sql", "encryption", "ledger"]
 categories = ["database-implementations"]
 
+[features]
+default = []
+# Serialização (JSON) das fotos do painel, usada pelo Studio e pelo servidor.
+serde = ["siouxdb-metricas/serde"]
+
 [dependencies]
 siouxdb-vfs.workspace = true
 siouxdb-armazenamento.workspace = true
+siouxdb-metricas.workspace = true
 
 [lints]
 workspace = true

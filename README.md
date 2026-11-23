@@ -81,6 +81,8 @@ Só o motor é obrigatório; o resto é opcional. Embutido (como o SQLite) ou se
 - `siouxdb-vfs`: disco real e disco simulado. O simulado reproduz queda de energia com gravações perdidas ou cortadas no meio de um setor, de forma determinística por semente;
 - `siouxdb-armazenamento`: páginas com verificação (CRC32C + número da página), cabeçalho em duas cópias alternadas, cache SIEVE e paginador. Testado com centenas de quedas simuladas: nunca aceita página misturada;
 - comando `sioux criar | info | verificar`.
+- `siouxdb-metricas`: histograma sem trava, séries de 60 s e alertas configuráveis;
+- **SiouxDB Studio** (`studio/`, Tauri): painel de monitoramento em tempo real sobre um arquivo ou uma demonstração com carga gerada.
 
 ## Compilar e testar
 

@@ -1,0 +1,29 @@
+[package]
+name = "siouxdb-studio"
+description = "SiouxDB Studio: cliente visual e painel de monitoramento em tempo real."
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/OrlGustavo33/siouxdb"
+authors = ["Sioux e contribuidores do SiouxDB"]
+publish = false
+
+[dependencies]
+siouxdb = { path = "../../crates/siouxdb", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

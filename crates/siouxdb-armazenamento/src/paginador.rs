@@ -23,10 +23,12 @@ use crate::{
     Cabecalho, CacheSieve, ErroArmazenamento, EstatisticasCache, NumeroPagina, PAGINAS_RESERVADAS,
     Pagina, Resultado, TAMANHO_CABECALHO, TamanhoPagina, TipoPagina,
 };
+use siouxdb_metricas::{FotoHistograma, Histograma, Leitura};
 use siouxdb_vfs::{Arquivo, ModoAbertura, Vfs};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 /// Números do paginador, para acompanhamento.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +45,8 @@ pub struct EstatisticasPaginador {
     pub gravacoes: u64,
     /// Confirmações concluídas.
     pub confirmacoes: u64,
+    /// Operações públicas concluídas (alocar, ler, gravar, liberar, confirmar).
+    pub operacoes: u64,
     /// Páginas liberadas esperando a próxima confirmação.
     pub liberadas_pendentes: usize,
     /// Contadores do cache de páginas.
@@ -65,6 +69,8 @@ pub struct Paginador<A: Arquivo> {
     leituras_de_disco: AtomicU64,
     gravacoes: AtomicU64,
     confirmacoes: AtomicU64,
+    operacoes: AtomicU64,
+    latencia: Histograma,
 }
 
 impl<A: Arquivo> Paginador<A> {
@@ -153,6 +159,8 @@ impl<A: Arquivo> Paginador<A> {
             leituras_de_disco: AtomicU64::new(0),
             gravacoes: AtomicU64::new(0),
             confirmacoes: AtomicU64::new(0),
+            operacoes: AtomicU64::new(0),
+            latencia: Histograma::novo(),
         }
     }
 
@@ -192,6 +200,10 @@ impl<A: Arquivo> Paginador<A> {
     /// Reserva uma página do tipo dado, já gravada zerada, e devolve o número dela.
     /// Reaproveita uma página livre se houver; senão, aumenta o arquivo.
     pub fn alocar(&self, tipo: TipoPagina) -> Resultado<NumeroPagina> {
+        self.medir(|| self.alocar_sem_medir(tipo))
+    }
+
+    fn alocar_sem_medir(&self, tipo: TipoPagina) -> Resultado<NumeroPagina> {
         let mut e = self.estado_usavel()?;
         while e.cabecalho.primeira_livre != 0 {
             let n = e.cabecalho.primeira_livre;
@@ -227,12 +239,18 @@ impl<A: Arquivo> Paginador<A> {
 
     /// Lê uma página (do cache ou do disco), sempre verificada.
     pub fn ler(&self, numero: NumeroPagina) -> Resultado<Arc<Pagina>> {
-        self.conferir_limites(&*self.estado_usavel()?, numero)?;
-        self.ler_sem_conferir_limites(numero)
+        self.medir(|| {
+            self.conferir_limites(&*self.estado_usavel()?, numero)?;
+            self.ler_sem_conferir_limites(numero)
+        })
     }
 
     /// Grava uma página na posição `numero` (que precisa ter sido alocada).
     pub fn gravar(&self, numero: NumeroPagina, pagina: Pagina) -> Resultado<()> {
+        self.medir(|| self.gravar_sem_medir(numero, pagina))
+    }
+
+    fn gravar_sem_medir(&self, numero: NumeroPagina, pagina: Pagina) -> Resultado<()> {
         let e = self.estado_usavel()?;
         self.conferir_limites(&e, numero)?;
         if pagina.tamanho() != self.tamanho.bytes() {
@@ -247,6 +265,10 @@ impl<A: Arquivo> Paginador<A> {
     /// Devolve uma página ao banco. Ela continua legível até a próxima confirmação e só
     /// volta a ser entregue por [`Paginador::alocar`] depois dela.
     pub fn liberar(&self, numero: NumeroPagina) -> Resultado<()> {
+        self.medir(|| self.liberar_sem_medir(numero))
+    }
+
+    fn liberar_sem_medir(&self, numero: NumeroPagina) -> Resultado<()> {
         let mut e = self.estado_usavel()?;
         self.conferir_limites(&e, numero)?;
         if !e.liberadas.contains(&numero) {
@@ -262,6 +284,10 @@ impl<A: Arquivo> Paginador<A> {
     /// ([`ErroArmazenamento::ConfirmacaoFalhou`]): depois de um `fsync` que falhou não dá
     /// para saber o que chegou ao disco, então o certo é fechar e abrir de novo.
     pub fn confirmar(&self) -> Resultado<()> {
+        self.medir(|| self.confirmar_sem_medir())
+    }
+
+    fn confirmar_sem_medir(&self) -> Resultado<()> {
         let mut e = self.estado_usavel()?;
         let novo = match self.confirmar_no_disco(&e.cabecalho) {
             Ok(novo) => novo,
@@ -306,6 +332,38 @@ impl<A: Arquivo> Paginador<A> {
         }
     }
 
+    fn medir<T>(&self, f: impl FnOnce() -> Resultado<T>) -> Resultado<T> {
+        let inicio = Instant::now();
+        let r = f();
+        self.latencia.registrar_duracao(inicio.elapsed());
+        self.operacoes.fetch_add(1, Ordering::Relaxed);
+        r
+    }
+
+    /// Latências (ns) acumuladas das operações públicas.
+    pub fn latencias(&self) -> FotoHistograma {
+        self.latencia.foto()
+    }
+
+    /// Leitura para o coletor do painel ([`siouxdb_metricas::Coletor`]). No modo embutido a
+    /// única "conexão" é o próprio paginador e não há fila de escritor.
+    pub fn leitura_metricas(&self) -> Leitura {
+        let e = self.estatisticas();
+        Leitura {
+            instante: Instant::now(),
+            conexoes_ativas: 1,
+            conexoes_limite: 0,
+            operacoes: e.operacoes,
+            acertos_cache: e.cache.acertos,
+            faltas_cache: e.cache.faltas,
+            gravacoes: e.gravacoes,
+            confirmacoes: e.confirmacoes,
+            bytes_banco: e.total_paginas * e.tamanho_pagina as u64,
+            fila_escritor: 0,
+            latencia: self.latencias(),
+        }
+    }
+
     /// Números para acompanhamento.
     pub fn estatisticas(&self) -> EstatisticasPaginador {
         let e = self.travar_estado();
@@ -316,6 +374,7 @@ impl<A: Arquivo> Paginador<A> {
             leituras_de_disco: self.leituras_de_disco.load(Ordering::Relaxed),
             gravacoes: self.gravacoes.load(Ordering::Relaxed),
             confirmacoes: self.confirmacoes.load(Ordering::Relaxed),
+            operacoes: self.operacoes.load(Ordering::Relaxed),
             liberadas_pendentes: e.liberadas.len(),
             cache: self.travar_cache().estatisticas(),
         }
@@ -494,6 +553,13 @@ mod testes {
         assert_eq!(
             (e.leituras_de_disco, e.cache.acertos, e.cache.faltas),
             (1, 4, 1)
+        );
+        assert_eq!(e.operacoes, 5);
+        assert_eq!(p.latencias().contagem(), 5);
+        let l = p.leitura_metricas();
+        assert_eq!(
+            (l.operacoes, l.acertos_cache, l.bytes_banco),
+            (5, 4, 3 * 4096)
         );
     }
 

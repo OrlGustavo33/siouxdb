@@ -13,6 +13,9 @@ pub use siouxdb_vfs as vfs;
 /// Páginas verificadas, cabeçalho duplo à prova de queda e cache SIEVE.
 pub use siouxdb_armazenamento as armazenamento;
 
+/// Contadores, histogramas e o coletor do painel em tempo real.
+pub use siouxdb_metricas as metricas;
+
 /// Versão desta biblioteca.
 pub const VERSAO: &str = env!("CARGO_PKG_VERSION");
 

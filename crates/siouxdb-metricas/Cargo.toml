@@ -1,0 +1,22 @@
+[package]
+name = "siouxdb-metricas"
+description = "Métricas do SiouxDB: contadores, histogramas sem trava e o coletor do painel em tempo real."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

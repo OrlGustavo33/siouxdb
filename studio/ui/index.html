@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SiouxDB Studio</title>
+  <link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+  <header class="topo">
+    <div class="marca">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="7" ry="2.5"/><path d="M5 5.5v13c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5v-13"/><path d="M5 10c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5M5 14.5c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5"/></svg>
+      <strong>SiouxDB Studio</strong>
+    </div>
+    <div class="origem" id="origem" hidden></div>
+    <nav class="acoes">
+      <button data-acao="abrir">Abrir</button>
+      <button data-acao="novo">Novo</button>
+      <button data-acao="demonstracao">Demonstração</button>
+      <button data-acao="verificar" data-precisa-sessao disabled>Verificar</button>
+      <button data-acao="limites" class="icone" title="Limites dos alertas" aria-label="Limites dos alertas">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
+      </button>
+      <button data-acao="fechar" data-precisa-sessao disabled>Fechar</button>
+    </nav>
+  </header>
+
+  <form class="barra-arquivo" id="barra-arquivo" hidden>
+    <label>Arquivo <input id="caminho" type="text" placeholder="/caminho/para/banco.sdb" autocomplete="off" spellcheck="false"></label>
+    <label id="rotulo-kb" hidden>Página
+      <select id="kb"><option>4</option><option selected>8</option><option>16</option><option>32</option></select> KiB
+    </label>
+    <button type="submit" class="primario" id="confirmar-arquivo">Abrir</button>
+    <button type="button" data-acao="cancelar-arquivo">Cancelar</button>
+  </form>
+
+  <div class="mensagem" id="mensagem" role="status" hidden></div>
+
+  <main id="vazio" class="vazio">
+    <h1>Nenhum banco aberto</h1>
+    <p>Abra um arquivo <code>.sdb</code>, crie um novo ou rode a demonstração para ver o painel em tempo real.</p>
+    <div class="vazio-acoes">
+      <button class="primario" data-acao="demonstracao">Rodar demonstração</button>
+      <button data-acao="abrir">Abrir arquivo</button>
+      <button data-acao="novo">Criar banco</button>
+    </div>
+  </main>
+
+  <main id="painel" class="painel" hidden>
+    <section class="alertas" id="alertas" aria-live="polite"></section>
+    <section class="cartoes" id="cartoes"></section>
+    <section class="inferior">
+      <article class="bloco">
+        <h2>Conexões agora</h2>
+        <table class="tabela">
+          <thead><tr><th>#</th><th>Quem</th><th>Origem</th><th>Estado</th><th>Consulta</th></tr></thead>
+          <tbody id="conexoes"></tbody>
+        </table>
+        <p class="nota" id="nota-conexoes"></p>
+      </article>
+      <article class="bloco">
+        <h2>Saúde</h2>
+        <dl class="saude" id="saude"></dl>
+      </article>
+    </section>
+  </main>
+
+  <footer class="rodape">
+    <span id="rodape-estado">Atualiza a cada segundo · pausa com a janela oculta</span>
+    <span id="versao"></span>
+  </footer>
+
+  <dialog id="dialogo-limites">
+    <form method="dialog" id="form-limites">
+      <h2>Limites dos alertas</h2>
+      <label>Latência p99 acima de <span><input name="p99_ms" type="number" min="0.001" step="any"> ms</span></label>
+      <label>Acerto do cache abaixo de <span><input name="cache_pct" type="number" min="0" max="100" step="any"> %</span></label>
+      <label>Fila do escritor a partir de <span><input name="fila" type="number" min="0" step="1"> transações</span></label>
+      <label>Uso de conexões acima de <span><input name="conexoes_pct" type="number" min="1" max="100" step="any"> %</span></label>
+      <p class="nota">Crítico (vermelho) ao dobro da latência e da fila, ou com 100 % das conexões em uso.</p>
+      <div class="dialogo-acoes">
+        <button value="cancelar" formnovalidate>Cancelar</button>
+        <button value="salvar" class="primario">Salvar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

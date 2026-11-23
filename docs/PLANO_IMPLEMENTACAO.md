@@ -270,7 +270,7 @@ Estimativas para **1 pessoa em tempo integral com apoio de agentes**. Cada marco
 
 ### v0.2 — Servidor, Studio e Backup (≈ 14–18 semanas)
 - **sioux-servidor:** seções 2.11 e 2.12 — protocolo do PostgreSQL, TLS 1.3, SCRAM, regras de acesso, gerência de conexões, `sys_conexoes`, desligamento gracioso, `/metricas`. Pronto quando: `psql` e `sqlx` conectam; teste de carga com 5.000 conexões ociosas + 200 ativas sem estourar memória; teste de cliente que some no meio da transação libera o escritor no tempo configurado.
-- **siouxdb-metricas + painel do Studio:** seção 2.13 (o esqueleto do painel sobre o arquivo local já começa na v0.1).
+- **siouxdb-metricas + painel do Studio:** seção 2.13. **Já feito em 22/11:** crate de métricas e o painel do Studio sobre arquivo local e demonstração; falta a fonte "servidor" (`/painel/fluxo`), conexões reais, consultas lentas e backup.
 - **sioux-backup:**
   - cópia única (`BACKUP PARA`), incremental com deduplicação por hash e contínua com envio do WAL;
   - restauração até um instante, sempre num arquivo novo, verificado e só então trocado;
