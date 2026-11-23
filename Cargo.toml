@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/siouxdb-vfs", "crates/siouxdb", "crates/siouxdb-cli"]
+members = ["crates/siouxdb-vfs", "crates/siouxdb-armazenamento", "crates/siouxdb", "crates/siouxdb-cli"]
 
 [workspace.package]
 version = "0.0.1"
@@ -20,6 +20,7 @@ all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
 siouxdb-vfs = { path = "crates/siouxdb-vfs", version = "0.0.1" }
+siouxdb-armazenamento = { path = "crates/siouxdb-armazenamento", version = "0.0.1" }
 siouxdb = { path = "crates/siouxdb", version = "0.0.1" }
 
 [profile.release]

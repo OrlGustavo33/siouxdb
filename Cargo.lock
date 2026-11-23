@@ -6,6 +6,14 @@ version = 4
 name = "siouxdb"
 version = "0.0.1"
 dependencies = [
+ "siouxdb-armazenamento",
+ "siouxdb-vfs",
+]
+
+[[package]]
+name = "siouxdb-armazenamento"
+version = "0.0.1"
+dependencies = [
  "siouxdb-vfs",
 ]
 
