@@ -2,7 +2,9 @@
 
 **Para:** quem vai construir o projeto (pessoas e agentes de IA).
 **Base:** o desenho do ecossistema (9 peças, roteiro v0.1 → v0.5+) descrito no README.
-**Situação em 22/11/2026:** nada implementado. Este documento é o caminho do zero até a v0.5.
+**Situação em 22/11/2026:** M0 e M1 prontos (disco real/simulado, páginas verificadas, cabeçalho duplo, cache SIEVE, CLI `criar`/`info`/`verificar`). Este documento é o caminho até a v0.5.
+
+**Requisitos acrescentados em 22/11:** o SiouxDB também roda em **modo servidor**, como o PostgreSQL (seção 2.11), com **gerência de conexões** cuidadosa (2.12), e o **Studio** tem um **painel de monitoramento em tempo real**, simples e objetivo (2.13).
 
 ---
 
@@ -33,13 +35,15 @@
 siouxdb/
 ├─ crates/
 │  ├─ siouxdb-vfs        # acesso a arquivo/disco (real e simulado para testes)
-│  ├─ siouxdb-crypto     # envelopes de chave, cifra de página e coluna, Argon2id, índice cego
-│  ├─ siouxdb-storage    # páginas, cache (SIEVE), WAL, camada quente, camada fria em colunas
-│  ├─ siouxdb-ledger     # cadeia de hashes, Merkle Mountain Range, pontos de controle assinados
-│  ├─ siouxdb-mvcc       # versões, fotos (snapshots), épocas, escritor único
-│  ├─ siouxdb-index      # B+tree, ART, índice adaptativo, índice aprendido (PGM)
-│  ├─ siouxdb-sql        # parser (sqlparser) + extensões, planejador, execução vetorizada
-│  ├─ siouxdb-catalog    # catálogo do sistema (tabelas sys_*), usuários, permissões
+│  ├─ siouxdb-cripto         # envelopes de chave, cifra de página e coluna, Argon2id, índice cego
+│  ├─ siouxdb-armazenamento  # páginas, cache (SIEVE), WAL, camada quente, camada fria em colunas  ✅ M1
+│  ├─ siouxdb-razao          # cadeia de hashes, Merkle Mountain Range, pontos de controle assinados
+│  ├─ siouxdb-mvcc           # versões, fotos (snapshots), épocas, escritor único
+│  ├─ siouxdb-indices        # B+tree, ART, índice adaptativo, índice aprendido (PGM)
+│  ├─ siouxdb-sql            # parser (sqlparser) + extensões, planejador, execução vetorizada
+│  ├─ siouxdb-catalogo       # catálogo do sistema (tabelas sys_*), usuários, permissões
+│  ├─ siouxdb-metricas       # contadores, histogramas sem trava, séries de 60 s (base do painel)
+│  ├─ sioux-servidor         # modo servidor: protocolo do PostgreSQL, TLS, SCRAM, gerência de conexões
 │  ├─ siouxdb            # fachada: API pública em Rust (é o que as pessoas usam)
 │  ├─ siouxdb-capi       # interface C (cbindgen) — base para outras linguagens
 │  ├─ siouxdb-cli        # comando `sioux`
@@ -63,7 +67,9 @@ siouxdb/
 └─ .github/workflows/
 ```
 
-Dependência entre crates (de baixo para cima): `vfs → crypto → storage → ledger/mvcc → index → catalog → sql → siouxdb → (capi, cli, ferramentas, bindings, studio)`.
+Dependência entre crates (de baixo para cima): `vfs → cripto → armazenamento → razao/mvcc → indices → catalogo → sql → siouxdb → (capi, cli, servidor, ferramentas, bindings, studio)`. `metricas` não depende de nada e é usado por todos.
+
+Nomes de crates, tipos, funções e tabelas do sistema em **português** (ex.: `sys_conexoes`, não `sys_connections`).
 
 ---
 
@@ -170,6 +176,54 @@ for linha in db.ler()?.consultar("SELECT nome FROM clientes WHERE cpf = ?", para
 - Tipos de erro claros; nada de `panic` em caminho de usuário.
 - `siouxdb-capi` expõe a mesma coisa em C (`sioux_open`, `sioux_exec`, `sioux_prepare`, `sioux_step`...), com cabeçalho gerado por `cbindgen`.
 
+### 2.11 Modo servidor — `sioux-servidor`
+O mesmo motor, o mesmo arquivo: em vez de cada programa abrir o arquivo, um processo `sioux servidor` fica dono dele (trava exclusiva) e atende pela rede. Embutido e servidor são **dois jeitos de usar o mesmo banco**: dá para começar embutido e virar servidor sem migrar nada.
+
+- **Protocolo:** o do PostgreSQL (versão 3), com a crate `pgwire`. Assim `psql`, DBeaver, JDBC, npgsql, `sqlx`, `psycopg`, `node-postgres` e o próprio Studio conectam sem driver novo. Um `pg_catalog` mínimo responde às perguntas que essas ferramentas fazem ao conectar. Diferenças de dialeto ficam documentadas em `spec/SQL.md`.
+- **Vários bancos:** uma pasta de dados com um arquivo por banco (`dados/loja.sdb`, `dados/clinica.sdb`); o nome do banco na conexão escolhe o arquivo.
+- **Segurança da conexão (padrão ligado):**
+  - TLS 1.3 obrigatório (`rustls`); sem TLS só em `127.0.0.1`/socket Unix, e só se configurado;
+  - autenticação SCRAM-SHA-256 (nunca senha em claro); certificado do cliente (mTLS) opcional, por usuário;
+  - regras de acesso por rede, usuário e banco em `sioux-acesso.toml` (equivalente ao `pg_hba.conf`, com recusa por padrão);
+  - bloqueio progressivo depois de senhas erradas por usuário e por IP;
+  - toda entrada, saída e recusa vai para a trilha encadeada do razão.
+- **Administração:** `sioux servidor iniciar|parar|recarregar|estado`; configuração em `sioux-servidor.toml`, recarregável sem derrubar conexões; serviço systemd/Windows.
+- **Monitoramento:** porta administrativa separada (padrão: só `127.0.0.1`) com `/metricas` (formato Prometheus) e `/painel/fluxo` (uma foto por segundo, usado pelo Studio); exige token.
+- **Cluster:** quando o `sioux-cluster` existir, cada servidor é uma máquina do Raft; o cliente fala com qualquer uma (leituras locais com atraso máximo, escritas encaminhadas ao líder).
+
+### 2.12 Gerência de conexões
+Objetivo: muitas conexões baratas, nenhuma conexão capaz de travar o banco, e tudo visível.
+
+- **Sessão leve:** uma tarefa `tokio` por conexão (poucos KB), não um processo como no PostgreSQL. Milhares de conexões ociosas custam pouco, então não é preciso PgBouncer na frente.
+- **Limites (todos configuráveis):** total do servidor, por usuário, por banco e por IP de origem; vagas reservadas para administrador (para conseguir entrar e consertar quando estiver cheio); limite de novas conexões por segundo por IP.
+- **Admissão com fila:** passou do limite de consultas **em execução**, a consulta espera numa fila curta (com tempo máximo e prioridade por papel) em vez de derrubar o servidor; fila cheia → recusa com erro claro. CoDel na fila evita espera infinita sob sobrecarga.
+- **Tempos limite:**
+  - autenticação (padrão 10 s);
+  - conexão ociosa;
+  - **ociosa dentro de transação** (a mais perigosa: segura foto antiga e, se for de escrita, o escritor único);
+  - duração máxima de consulta e de transação;
+  - espera pela vez do escritor.
+- **Escritor único justo:** transações de escrita entram em fila por ordem de chegada, com tempo máximo de espera; leitores nunca esperam escritor. O painel mostra quem está escrevendo e quem está na fila.
+- **Memória:** orçamento por sessão e global; consulta que estoura vai para disco (spill) ou é cancelada com erro explicando o limite.
+- **Cancelar e derrubar:** `CancelRequest` do protocolo, `SELECT sys_cancelar(id)` (para a consulta) e `SELECT sys_derrubar(id)` (fecha a conexão), também pelo Studio.
+- **Visibilidade:** `sys_conexoes` (id, usuário, banco, origem, aplicação, TLS, estado, desde, consulta atual, tempo nela, esperando o quê, bytes in/out) e `sys_esperas`.
+- **Comandos preparados e planos:** por sessão com limite de quantidade; cache de planos compartilhado entre sessões.
+- **Desligamento gracioso:** para de aceitar, espera as transações acabarem por N segundos, cancela o resto, faz ponto de controle e fecha. `recarregar` aplica nova configuração sem derrubar ninguém.
+- **Proteções:** tamanho máximo de mensagem, de consulta e de resultado; keepalive TCP para descobrir cliente que sumiu.
+
+### 2.13 Monitoramento e painel do Studio — `siouxdb-metricas`
+- **Coleta sempre ligada e barata:** contadores e medidores atômicos, histogramas logarítmicos sem trava (latência p50/p95/p99 em nanossegundos de custo) e séries de 60 pontos (1 por segundo). Funciona igual embutido e servidor.
+- **Saídas:** `SELECT * FROM sys_metricas`, `/metricas` (Prometheus) e `/painel/fluxo` (servidor), e uma `Foto` em Rust para quem embute.
+- **O painel (uma tela só, sem rolagem num monitor comum):**
+  1. **Seis números grandes**, cada um com gráfico dos últimos 60 s: conexões (ativas/limite), consultas por segundo, latência p99, acerto do cache, gravações no WAL por segundo, tamanho do banco;
+  2. **Conexões agora:** quem, de onde, estado, consulta atual e há quanto tempo, com botões Cancelar/Derrubar;
+  3. **Consultas lentas:** as 10 piores do período, com plano;
+  4. **Escritor e fila:** quem escreve, quantos esperam, maior espera;
+  5. **Saúde:** última verificação do razão, último ponto de controle, último backup e o próximo, atraso das réplicas (quando houver);
+  6. **Alertas** em cores, com limites configuráveis (ex.: p99 > 50 ms, cache < 90 %, fila > 5).
+- **Regra de desenho:** simples e objetivo. Números grandes, verde/amarelo/vermelho só quando muda algo, nada de 40 gráficos. Atualiza a cada segundo, pausa quando a janela não está visível.
+- **Fontes:** arquivo local (o Studio abre o arquivo e lê as métricas do próprio processo) ou servidor (conecta em `/painel/fluxo` com token).
+
 ---
 
 ## 3. Testes e confiança (vale para todas as fases)
@@ -205,7 +259,7 @@ Estimativas para **1 pessoa em tempo integral com apoio de agentes**. Cada marco
 | Marco | Entrega | Pronto quando |
 |---|---|---|
 | M0 (1 sem) | Repositório, workspace, CI (fmt, clippy, test, Miri, deny), licenças, `SECURITY.md`, `spec/FORMATO.md` v0 | CI verde no esqueleto |
-| M1 (2 sem) | VFS real e simulado; páginas; cabeçalho duplo; cache SIEVE | arquivo cria, abre e fecha; teste de queda no cabeçalho passa |
+| M1 (2 sem) ✅ | VFS real e simulado; páginas; cabeçalho duplo; cache SIEVE | arquivo cria, abre e fecha; teste de queda no cabeçalho passa — **feito 22/11** |
 | M2 (2 sem) | Criptografia de página; Argon2id; keyring; chave-mestra embrulhada | arquivo ilegível sem chave; byte trocado é detectado |
 | M3 (3 sem) | WAL, transações, escritor único, leitores com foto, gravação em grupo, recuperação | simulador: 1 milhão de passos com quedas sem violar invariante |
 | M4 (2 sem) | Camada quente + B+tree primária; catálogo `sys_*` | inserir, ler por chave e varrer 10 milhões de linhas |
@@ -214,7 +268,9 @@ Estimativas para **1 pessoa em tempo integral com apoio de agentes**. Cada marco
 | M7 (1 sem) | Colunas cifradas, índice cego, mascaramento, chave por titular | exclusão de titular torna os dados ilegíveis, inclusive no histórico |
 | M8 (1 sem) | CLI `sioux`, `siouxdb-capi`, docs, benchmark inicial, release 0.1.0 assinado | instalação em 1 comando; README com números honestos |
 
-### v0.2 — Studio, Migra e Backup (≈ 12–16 semanas)
+### v0.2 — Servidor, Studio e Backup (≈ 14–18 semanas)
+- **sioux-servidor:** seções 2.11 e 2.12 — protocolo do PostgreSQL, TLS 1.3, SCRAM, regras de acesso, gerência de conexões, `sys_conexoes`, desligamento gracioso, `/metricas`. Pronto quando: `psql` e `sqlx` conectam; teste de carga com 5.000 conexões ociosas + 200 ativas sem estourar memória; teste de cliente que some no meio da transação libera o escritor no tempo configurado.
+- **siouxdb-metricas + painel do Studio:** seção 2.13 (o esqueleto do painel sobre o arquivo local já começa na v0.1).
 - **sioux-backup:**
   - cópia única (`BACKUP PARA`), incremental com deduplicação por hash e contínua com envio do WAL;
   - restauração até um instante, sempre num arquivo novo, verificado e só então trocado;
@@ -227,6 +283,7 @@ Estimativas para **1 pessoa em tempo integral com apoio de agentes**. Cada marco
   - histórico e consultas salvas;
   - **somente leitura por padrão**, confirmação para `UPDATE`/`DELETE` e faixa de aviso em conexão marcada como produção;
   - diagrama das tabelas, comparação de esquemas e "de onde veio esse número".
+### v0.3 — Migra, Sync e Ponte (≈ 14–18 semanas)
 - **sioux-migra:**
   - leitores de origem: Firebird (`rsfbclient`), MySQL (`mysql_async`), PostgreSQL (`tokio-postgres`), SQL Server (`tiberius`), SQLite, DBF, CSV/planilhas (`calamine`) e XML de NF-e;
   - perfil local da origem (tipos, contagens, qualidade, dado pessoal detectado e mascarado);
@@ -236,7 +293,6 @@ Estimativas para **1 pessoa em tempo integral com apoio de agentes**. Cada marco
   - saída num arquivo SiouxDB com **certificado de migração** (raiz e manifesto assinado) e delta por hash no dia da virada;
   - receitas reutilizáveis por sistema de origem e destinos plugáveis com contrato.
 
-### v0.3 — Sync e Ponte (≈ 10–14 semanas)
 - **sioux-sync:**
   - captura de mudanças: PostgreSQL por replicação lógica (`pgoutput`), MySQL por binlog em modo de linha, Firebird por gatilhos + tabela de registro (instalados por receita, com remoção limpa);
   - **dono por tabela ou por parte dela**; conflito gera alerta e nunca é sobrescrito em silêncio;

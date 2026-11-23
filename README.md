@@ -43,7 +43,8 @@ Para quem: saúde, jurídico, financeiro, governo, logs de auditoria, cofres de 
 | Peça | O que faz |
 |---|---|
 | **siouxdb** (motor) | SQL relacional, transações, cifra nativa, histórico e verificação. Biblioteca Rust com interface C |
-| **sioux-studio** | Cliente visual estilo DBeaver, em Tauri. Abre SiouxDB, PostgreSQL, MySQL, Firebird e SQLite |
+| **sioux-servidor** | O mesmo motor em **modo servidor**, como o PostgreSQL: fala o protocolo do PostgreSQL (psql, DBeaver, JDBC, sqlx... conectam direto), TLS 1.3, SCRAM e gerência de conexões com limites, fila e tempos configuráveis |
+| **sioux-studio** | Cliente visual estilo DBeaver, em Tauri, com **painel de monitoramento em tempo real** (conexões, consultas/s, latência, cache, WAL, fila do escritor, saúde). Abre SiouxDB, PostgreSQL, MySQL, Firebird e SQLite |
 | **sioux-backup** | Backup a quente, incremental e contínuo, verificado por hash e testado sozinho |
 | **sioux-cluster** | Replicação opcional com Raft e quórum configurável |
 | **sioux-ia** | IA local opcional: perguntas em português viram SQL conferido, busca por significado |
@@ -52,7 +53,7 @@ Para quem: saúde, jurídico, financeiro, governo, logs de auditoria, cofres de 
 | **sioux-sync** | Sincronização contínua com PostgreSQL, MySQL e Firebird |
 | **sioux-ponte** | Troca de sistema por partes, com o sistema antigo exposto como API segura |
 
-Só o motor é obrigatório; o resto é opcional.
+Só o motor é obrigatório; o resto é opcional. Embutido (como o SQLite) ou servidor (como o PostgreSQL) é escolha de uso: o arquivo é o mesmo.
 
 ## Stack
 
@@ -70,15 +71,16 @@ Só o motor é obrigatório; o resto é opcional.
 | Versão | Conteúdo |
 |---|---|
 | **v0.1** | Núcleo confiável: arquivo cifrado, SQL básico, transações, WAL, cadeia de hashes, `VERIFY`, `AS OF`, CLI e interface C |
-| v0.2 | Studio, Migra e Backup |
-| v0.3 | Sync e Ponte |
+| v0.2 | Modo servidor (protocolo do PostgreSQL, gerência de conexões), Studio com painel em tempo real e Backup |
+| v0.3 | Migra, Sync e Ponte |
 | v0.4 | Análise e desempenho: colunas, índices adaptativo e aprendido, perfis e ajuste automático |
 | v0.5+ | Cluster com Raft e IA local |
 
-**Feito até agora (M0):**
-- workspace;
-- CI em Linux, macOS e Windows;
-- `siouxdb-vfs`, com disco real e disco simulado. O simulado reproduz queda de energia com gravações perdidas ou cortadas no meio de um setor, de forma determinística por semente.
+**Feito até agora (M0 e M1):**
+- workspace e CI em Linux, macOS e Windows;
+- `siouxdb-vfs`: disco real e disco simulado. O simulado reproduz queda de energia com gravações perdidas ou cortadas no meio de um setor, de forma determinística por semente;
+- `siouxdb-armazenamento`: páginas com verificação (CRC32C + número da página), cabeçalho em duas cópias alternadas, cache SIEVE e paginador. Testado com centenas de quedas simuladas: nunca aceita página misturada;
+- comando `sioux criar | info | verificar`.
 
 ## Compilar e testar
 
@@ -86,7 +88,8 @@ Só o motor é obrigatório; o resto é opcional.
 git clone https://github.com/OrlGustavo33/siouxdb
 cd siouxdb
 cargo test
-cargo run -p siouxdb-cli -- --version
+cargo run -p siouxdb-cli -- criar teste.sdb
+cargo run -p siouxdb-cli -- info teste.sdb
 ```
 
 ## Como o projeto nasceu
@@ -117,8 +120,10 @@ Toda contribuição enviada para este projeto é licenciada nos mesmos dois term
 - **tamper-evident**, with a hash chain, Merkle Mountain Range and signed checkpoints;
 - **time travel**: every change is kept and queryable with `AS OF`.
 
-The planned ecosystem adds a desktop studio (Tauri), hot/incremental backups, optional Raft replication, optional local AI, and migration, sync and bridge tools for moving off legacy databases.
+It can also run in **server mode**, like PostgreSQL: same file, speaking the PostgreSQL wire protocol (so `psql`, JDBC, `sqlx`, etc. connect as-is), TLS 1.3 + SCRAM, and careful connection management (per-user/IP limits, admission queue, idle-in-transaction timeouts, fair single-writer queue, graceful shutdown).
 
-**Status: pre-alpha.** Only the disk layer exists today, including a deterministic crash simulator. Do not store real data yet.
+The planned ecosystem adds a desktop studio (Tauri) with a simple real-time monitoring dashboard, hot/incremental backups, optional Raft replication, optional local AI, and migration, sync and bridge tools for moving off legacy databases.
+
+**Status: pre-alpha.** The disk layer (with a deterministic crash simulator) and checksummed page storage (dual header, SIEVE cache) exist today. Do not store real data yet.
 
 The project was conceived by **Sioux** (SiouxSys) and is being built with **Claude** (Anthropic) through **Claude Code in VS Code**, with human review. It is dual-licensed under MIT or Apache-2.0.
