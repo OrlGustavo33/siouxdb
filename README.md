@@ -134,7 +134,11 @@ SELECT * FROM sys_tabelas;   -- e sys_colunas, sys_indices
 - Pela linha de comando: `sioux sql banco.sdb "SELECT ..."`.
 - Por HTTP: o exemplo [`exemplos/microservico`](exemplos/microservico) (`POST /sql` e rotas REST), com token obrigatório.
 
-O SQL é um subconjunto (uma tabela por consulta, sem JOIN nem subconsulta por enquanto; transação só dentro de uma chamada). O planejador usa a chave primária ou um índice quando o `WHERE` tem `coluna = valor` ou faixas; um teste diferencial compara 1.500 consultas aleatórias com o mesmo filtro calculado fora do banco.
+```sql
+SELECT c.nome, SUM(p.total) FROM clientes c LEFT JOIN pedidos p ON p.cliente_id = c.id GROUP BY c.nome;
+```
+
+O SQL é um subconjunto: `INNER JOIN` e `LEFT JOIN` (com apelidos, vários seguidos, busca pela chave ou índice na tabela da direita); ainda sem subconsulta, `RIGHT`/`FULL JOIN`, `UNION` nem funções de janela; transação só dentro de uma chamada. O planejador usa a chave primária ou um índice quando o `WHERE` tem `coluna = valor` ou faixas; um teste diferencial compara 1.500 consultas aleatórias com o mesmo filtro calculado fora do banco.
 
 ## Compilar e testar
 

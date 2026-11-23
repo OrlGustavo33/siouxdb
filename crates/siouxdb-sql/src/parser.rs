@@ -45,9 +45,19 @@ pub(crate) enum Item {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Juncao {
+    pub tabela: String,
+    pub apelido: Option<String>,
+    pub esquerda: bool,
+    pub on: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Selecao {
     pub itens: Vec<Item>,
     pub tabela: Option<String>,
+    pub apelido: Option<String>,
+    pub juncoes: Vec<Juncao>,
     pub como_estava: Option<Expr>,
     pub onde: Option<Expr>,
     pub agrupar: Vec<Expr>,
@@ -348,6 +358,22 @@ impl Parser {
         )
     }
 
+    /// Apelido de tabela no FROM/JOIN: `AS x` (menos `AS OF`) ou um nome solto.
+    fn apelido_de_tabela(&mut self) -> Resultado<Option<String>> {
+        let as_of = matches!(&self.f[self.i].tok, Tok::Nome { texto, citado: false } if texto == "as")
+            && matches!(self.f.get(self.i + 1).map(|f| &f.tok), Some(Tok::Nome { texto, citado: false }) if texto == "of");
+        if as_of {
+            return Ok(None);
+        }
+        let tem_as = self.chave("as");
+        let livre = matches!(self.tok(), Tok::Nome { texto, citado } if *citado || !RESERVADAS.contains(&texto.as_str()));
+        Ok(if tem_as || livre {
+            Some(self.nome()?)
+        } else {
+            None
+        })
+    }
+
     fn se_nao_existe(&mut self) -> Resultado<bool> {
         if self.chave("if") {
             self.espera_chave("not")?;
@@ -580,6 +606,8 @@ impl Parser {
         let mut s = Selecao {
             itens,
             tabela: None,
+            apelido: None,
+            juncoes: Vec::new(),
             como_estava: None,
             onde: None,
             agrupar: Vec::new(),
@@ -590,6 +618,31 @@ impl Parser {
         };
         if self.chave("from") {
             s.tabela = Some(self.nome()?);
+            s.apelido = self.apelido_de_tabela()?;
+            loop {
+                let esquerda = if self.chave("left") {
+                    self.chave("outer");
+                    true
+                } else {
+                    self.chave("inner");
+                    false
+                };
+                if !self.chave("join") {
+                    if esquerda {
+                        return self.erro("esperava JOIN depois de LEFT");
+                    }
+                    break;
+                }
+                let tabela = self.nome()?;
+                let apelido = self.apelido_de_tabela()?;
+                self.espera_chave("on")?;
+                s.juncoes.push(Juncao {
+                    tabela,
+                    apelido,
+                    esquerda,
+                    on: self.expr()?,
+                });
+            }
             if self.chave("as") {
                 self.espera_chave("of")?;
                 s.como_estava = Some(self.expr()?);
@@ -834,9 +887,9 @@ impl Parser {
                     }
                     return Ok(Expr::Funcao(nome, args, false));
                 }
-                // tabela.coluna: o prefixo da tabela é aceito e ignorado (uma tabela por consulta).
+                // tabela.coluna: guarda o nome com o prefixo; quem executa resolve.
                 if self.simbolo(".") {
-                    return Ok(Expr::Coluna(self.nome()?));
+                    return Ok(Expr::Coluna(format!("{nome}.{}", self.nome()?)));
                 }
                 Ok(Expr::Coluna(nome))
             }
@@ -846,9 +899,10 @@ impl Parser {
 }
 
 /// Palavras que não podem ser nome sem aspas.
-const RESERVADAS: [&str; 41] = [
+const RESERVADAS: &[&str] = &[
     "select", "from", "where", "and", "or", "not", "insert", "into", "values", "update", "set",
     "delete", "create", "drop", "table", "index", "on", "primary", "key", "null", "is", "in",
     "between", "like", "order", "by", "group", "having", "limit", "offset", "as", "asc", "desc",
-    "unique", "true", "false", "if", "exists", "conflict", "do", "explain",
+    "unique", "true", "false", "if", "exists", "conflict", "do", "explain", "join", "left",
+    "inner", "outer",
 ];

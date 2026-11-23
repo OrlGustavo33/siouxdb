@@ -40,12 +40,41 @@ pub(crate) fn tem_coluna(e: &Expr) -> bool {
 }
 
 /// Confere, antes de executar, que toda coluna citada existe (`extras` = apelidos aceitos).
+/// Posição da coluna `c` nos `nomes` do contexto. Os nomes podem ser simples (`id`, uma
+/// tabela só) ou qualificados (`p.id`, com JOIN); `c` pode ser qualquer um dos dois.
+pub(crate) fn resolver_coluna(nomes: &[String], c: &str) -> Resultado<usize> {
+    if let Some(i) = nomes.iter().position(|n| n == c) {
+        return Ok(i);
+    }
+    match c.rsplit_once('.') {
+        // `t.x` com nomes simples: o prefixo é aceito.
+        Some((_, resto)) => {
+            if let Some(i) = nomes.iter().position(|n| n == resto) {
+                return Ok(i);
+            }
+        }
+        // `x` com nomes qualificados: precisa existir em uma tabela só.
+        None => {
+            let achou: Vec<usize> = nomes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.rsplit_once('.').is_some_and(|(_, r)| r == c))
+                .map(|(i, _)| i)
+                .collect();
+            match achou.len() {
+                1 => return Ok(achou[0]),
+                0 => {}
+                _ => return semantica(format!("a coluna \"{c}\" é ambígua: use tabela.coluna")),
+            }
+        }
+    }
+    semantica(format!("coluna \"{c}\" não existe"))
+}
+
 pub(crate) fn conferir_colunas(e: &Expr, nomes: &[String], extras: &[String]) -> Resultado<()> {
     let r = |x: &Expr| conferir_colunas(x, nomes, extras);
     match e {
-        Expr::Coluna(c) if !nomes.contains(c) && !extras.contains(c) => {
-            semantica(format!("coluna \"{c}\" não existe"))
-        }
+        Expr::Coluna(c) if !extras.contains(c) => resolver_coluna(nomes, c).map(|_| ()),
         Expr::Funcao(_, args, _) => args.iter().try_for_each(r),
         Expr::Nao(a) | Expr::Negativo(a) | Expr::EhNulo(a, _) => r(a),
         Expr::Bin(_, a, b) | Expr::Como(a, b, _) => r(a).and_then(|_| r(b)),
@@ -226,10 +255,7 @@ pub(crate) fn avaliar(e: &Expr, ctx: &Ctx<'_>) -> Resultado<Valor> {
                 ));
             }
         },
-        Expr::Coluna(c) => match ctx.nomes.iter().position(|n| n == c) {
-            Some(i) => ctx.linha[i].clone(),
-            None => return semantica(format!("coluna \"{c}\" não existe")),
-        },
+        Expr::Coluna(c) => ctx.linha[resolver_coluna(ctx.nomes, c)?].clone(),
         Expr::Nao(a) => match booleano(&avaliar(a, ctx)?, "NOT")? {
             None => Valor::Nulo,
             Some(b) => Valor::Booleano(!b),

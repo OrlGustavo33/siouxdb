@@ -2,7 +2,7 @@
 
 use crate::avaliar::{
     Ctx, avaliar, conferir_colunas, decimal_de, ordem_total, passa, resolver_agregados,
-    tem_agregado, tem_coluna,
+    resolver_coluna, tem_agregado, tem_coluna,
 };
 use crate::erro::semantica;
 use crate::parser::{ColDef, Comando, Conflito, Expr, Item, Op, Selecao, analisar};
@@ -76,10 +76,16 @@ fn no_tipo(v: Valor, tipo: Tipo) -> Option<Valor> {
 }
 
 /// Predicados simples "coluna op constante" das conjunções do WHERE.
-fn predicados(t: &Tabela, onde: Option<&Expr>, params: &[Valor]) -> Vec<(usize, Op, Valor)> {
+/// Predicados "coluna op constante" das conjunções de `onde`. `posicao` diz a qual coluna
+/// da tabela o nome se refere (ou `None` se for de outra tabela).
+fn predicados(
+    t: &Tabela,
+    onde: Option<&Expr>,
+    params: &[Valor],
+    posicao: &dyn Fn(&str) -> Option<usize>,
+) -> Vec<(usize, Op, Valor)> {
     let mut v = Vec::new();
     let Some(onde) = onde else { return v };
-    let posicao = |c: &str| t.def().colunas.iter().position(|x| x.nome == c);
     let inverter = |op: Op| match op {
         Op::Menor => Op::Maior,
         Op::MenorIgual => Op::MaiorIgual,
@@ -155,8 +161,18 @@ fn limites(
     Some((iguais.len(), faixa, inicio, fim))
 }
 
+/// Posição da coluna na tabela, aceitando `tabela.coluna`.
+fn posicao_simples(t: &Tabela, c: &str) -> Option<usize> {
+    let c = c.rsplit_once('.').map_or(c, |(_, r)| r);
+    t.def().colunas.iter().position(|x| x.nome == c)
+}
+
 fn planejar(t: &Tabela, onde: Option<&Expr>, params: &[Valor], lsn: u64) -> Acesso {
-    let preds = predicados(t, onde, params);
+    let preds = predicados(t, onde, params, &|c| posicao_simples(t, c));
+    planejar_preds(t, preds, lsn)
+}
+
+fn planejar_preds(t: &Tabela, preds: Vec<(usize, Op, Valor)>, lsn: u64) -> Acesso {
     if preds.is_empty() {
         return Acesso::Tudo;
     }
@@ -270,6 +286,9 @@ fn fonte<P: Paginas + ?Sized>(
         }
         return Ok((nomes, v, "tabela do sistema".into()));
     }
+    if !s.juncoes.is_empty() {
+        return fonte_juncao(p, s, params, lsn);
+    }
     let t = catalogo::tabela_obrigatoria(p, nome)?;
     let nomes: Vec<String> = t.def().colunas.iter().map(|c| c.nome.clone()).collect();
     if let Some(o) = &s.onde {
@@ -305,12 +324,217 @@ fn fonte<P: Paginas + ?Sized>(
     Ok((nomes, linhas, plano))
 }
 
+/// SELECT com JOIN: laço aninhado, com busca pela chave ou índice na tabela da direita
+/// quando o ON tem `direita.coluna = <algo da esquerda>`; o ON completo e o WHERE são
+/// sempre reaplicados, então o plano só muda a velocidade.
+fn fonte_juncao<P: Paginas + ?Sized>(
+    p: &P,
+    s: &Selecao,
+    params: &[Valor],
+    lsn: u64,
+) -> Resultado<(Vec<String>, Vec<Vec<Valor>>, String)> {
+    let nome0 = s.tabela.as_deref().unwrap_or_default();
+    let mut tabelas: Vec<(String, Tabela)> = Vec::new();
+    let mut declaradas = vec![(nome0, s.apelido.as_deref())];
+    declaradas.extend(
+        s.juncoes
+            .iter()
+            .map(|j| (j.tabela.as_str(), j.apelido.as_deref())),
+    );
+    for (nome, apelido) in &declaradas {
+        if nome.starts_with(catalogo::PREFIXO_SISTEMA) {
+            return semantica(
+                "tabelas do sistema (sys_*) não entram em JOIN; consulte-as sozinhas",
+            );
+        }
+        let visivel = apelido.unwrap_or(nome).to_string();
+        if tabelas.iter().any(|(n, _)| *n == visivel) {
+            return semantica(format!(
+                "a tabela \"{visivel}\" aparece duas vezes; use apelidos (AS x)"
+            ));
+        }
+        tabelas.push((visivel, catalogo::tabela_obrigatoria(p, nome)?));
+    }
+    let nomes_de = |(alias, t): &(String, Tabela)| -> Vec<String> {
+        t.def()
+            .colunas
+            .iter()
+            .map(|c| format!("{alias}.{}", c.nome))
+            .collect()
+    };
+    let todos: Vec<String> = tabelas.iter().flat_map(nomes_de).collect();
+    if let Some(o) = &s.onde {
+        conferir_colunas(o, &todos, &[])?;
+    }
+
+    // Tabela da esquerda: o planejador pode usar os predicados do WHERE que são só dela.
+    let (alias0, t0) = &tabelas[0];
+    let outros: Vec<String> = tabelas[1..].iter().flat_map(nomes_de).collect();
+    let posicao0 = |c: &str| -> Option<usize> {
+        match c.rsplit_once('.') {
+            Some((q, r)) if q == alias0 => t0.def().colunas.iter().position(|x| x.nome == r),
+            Some(_) => None,
+            None if outros
+                .iter()
+                .any(|n| n.rsplit_once('.').is_some_and(|(_, r)| r == c)) =>
+            {
+                None
+            }
+            None => t0.def().colunas.iter().position(|x| x.nome == c),
+        }
+    };
+    let acesso0 = planejar_preds(t0, predicados(t0, s.onde.as_ref(), params, &posicao0), lsn);
+    let mut plano = vec![format!("{alias0}: {}", descrever(&acesso0, t0))];
+    let mut linhas: Vec<Vec<Valor>> = Vec::new();
+    percorrer(p, t0, &acesso0, lsn, &mut |l| {
+        linhas.push(l);
+        Ok(true)
+    })?;
+    let mut nomes = nomes_de(&tabelas[0]);
+
+    for (k, j) in s.juncoes.iter().enumerate() {
+        let (alias, t) = &tabelas[k + 1];
+        let nomes_direita = nomes_de(&tabelas[k + 1]);
+        let mut juntos = nomes.clone();
+        juntos.extend(nomes_direita.iter().cloned());
+        conferir_colunas(&j.on, &juntos, &[])?;
+        // Igualdades `direita.col = expr da esquerda` do ON: delas sai a busca.
+        let mut ligacoes: Vec<(usize, &Expr)> = Vec::new();
+        for c in conjuncoes(&j.on) {
+            if let Expr::Bin(Op::Igual, a, b) = c {
+                for (lado, outro) in [(a, b), (b, a)] {
+                    if let Expr::Coluna(nome) = &**lado {
+                        let i = resolver_coluna(&juntos, nome)
+                            .ok()
+                            .filter(|i| *i >= nomes.len());
+                        if let Some(i) = i {
+                            if conferir_colunas(outro, &nomes, &[]).is_ok() && !tem_agregado(outro)
+                            {
+                                ligacoes.push((i - nomes.len(), outro));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let largura_direita = t.def().colunas.len();
+        let mut materializada: Option<Vec<Vec<Valor>>> = None;
+        let mut descricao = None;
+        let mut novas = Vec::new();
+        for esq in &linhas {
+            let ctx = Ctx {
+                nomes: &nomes,
+                linha: esq,
+                params,
+            };
+            let mut preds = Vec::new();
+            // Igualdade com NULL nunca é verdadeira: essa linha não casa com nada.
+            let mut sem_par = false;
+            for (i, e) in &ligacoes {
+                if let Ok(v) = avaliar(e, &ctx) {
+                    if matches!(v, Valor::Nulo) {
+                        sem_par = true;
+                    } else if let Some(v) = no_tipo(v, t.def().colunas[*i].tipo) {
+                        preds.push((*i, Op::Igual, v));
+                    }
+                }
+            }
+            let acesso = if sem_par {
+                Acesso::Ponto(Vec::new())
+            } else {
+                planejar_preds(t, preds, lsn)
+            };
+            if !matches!(acesso, Acesso::Tudo | Acesso::Ponto(_))
+                || (!sem_par && matches!(acesso, Acesso::Ponto(_)))
+            {
+                descricao.get_or_insert_with(|| descrever(&acesso, t));
+            }
+            let mut achou = false;
+            let mut erro = None;
+            let mut confere = |dir: &[Valor]| {
+                let mut combinada = esq.clone();
+                combinada.extend_from_slice(dir);
+                match passa(
+                    &j.on,
+                    &Ctx {
+                        nomes: &juntos,
+                        linha: &combinada,
+                        params,
+                    },
+                ) {
+                    Ok(true) => {
+                        achou = true;
+                        novas.push(combinada);
+                    }
+                    Ok(false) => {}
+                    Err(e) => erro = Some(e),
+                }
+                erro.is_none()
+            };
+            if sem_par {
+                // nada a procurar
+            } else if matches!(acesso, Acesso::Tudo) {
+                // Sem busca possível: lê a tabela da direita uma vez só.
+                if materializada.is_none() {
+                    let mut v = Vec::new();
+                    percorrer(p, t, &acesso, lsn, &mut |l| {
+                        v.push(l);
+                        Ok(true)
+                    })?;
+                    materializada = Some(v);
+                }
+                for dir in materializada.as_deref().unwrap_or_default() {
+                    if !confere(dir) {
+                        break;
+                    }
+                }
+            } else {
+                percorrer(p, t, &acesso, lsn, &mut |dir| Ok(confere(&dir)))?;
+            }
+            if let Some(e) = erro {
+                return Err(e);
+            }
+            if !achou && j.esquerda {
+                let mut combinada = esq.clone();
+                combinada.extend(std::iter::repeat_n(Valor::Nulo, largura_direita));
+                novas.push(combinada);
+            }
+        }
+        plano.push(format!(
+            "{alias}: {}",
+            descricao.unwrap_or_else(|| "varredura completa".into())
+        ));
+        linhas = novas;
+        nomes = juntos;
+    }
+    if let Some(o) = &s.onde {
+        let mut filtradas = Vec::with_capacity(linhas.len());
+        for l in linhas {
+            if passa(
+                o,
+                &Ctx {
+                    nomes: &nomes,
+                    linha: &l,
+                    params,
+                },
+            )? {
+                filtradas.push(l);
+            }
+        }
+        linhas = filtradas;
+    }
+    Ok((nomes, linhas, plano.join("; ")))
+}
+
 fn nome_saida(e: &Expr, apelido: &Option<String>, i: usize) -> String {
     if let Some(a) = apelido {
         return a.clone();
     }
     match e {
-        Expr::Coluna(c) => c.clone(),
+        Expr::Coluna(c) => c
+            .rsplit_once('.')
+            .map_or(c.as_str(), |(_, r)| r)
+            .to_string(),
         Expr::Funcao(f, ..) => f.clone(),
         _ => format!("coluna{}", i + 1),
     }
@@ -384,7 +608,7 @@ fn selecionar<P: Paginas + ?Sized>(
         }
         if let Expr::Coluna(c) = e {
             if let Some(i) = colunas.iter().position(|x| x == c) {
-                if !nomes.contains(c) || agregado {
+                if resolver_coluna(&nomes, c).is_err() || agregado {
                     return Ok(saida[i].clone());
                 }
             }

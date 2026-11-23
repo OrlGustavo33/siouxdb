@@ -1081,3 +1081,283 @@ fn wal_estragado_nunca_causa_panico() {
         assert!(r.is_ok(), "pânico na rodada {rodada}");
     }
 }
+
+#[test]
+fn join_basico_left_alias_plano_e_erros() {
+    let (_vfs, b) = banco();
+    exec(
+        &b,
+        "CREATE TABLE clientes (id INT PRIMARY KEY, nome TEXT, cidade TEXT);
+         CREATE TABLE pedidos (id SERIAL PRIMARY KEY, cliente_id INT, total DECIMAL);
+         CREATE INDEX pedidos_cliente ON pedidos (cliente_id);
+         INSERT INTO clientes VALUES (1, 'ANA', 'SP'), (2, 'BIA', 'RJ'), (3, 'CAIO', 'SP');
+         INSERT INTO pedidos (cliente_id, total) VALUES (1, 10), (1, 5.5), (2, 7), (9, 1)",
+        &[],
+    );
+    let dec = |s: &str| Valor::Decimal(siouxdb_catalogo::Decimal::de_texto(s).unwrap());
+    // INNER: pedidos sem cliente (9) e clientes sem pedido (3) ficam de fora.
+    assert_eq!(
+        q(
+            &b,
+            "SELECT c.nome, p.total FROM pedidos p JOIN clientes c ON c.id = p.cliente_id ORDER BY p.id",
+            &[]
+        ),
+        vec![
+            vec![v("ANA"), dec("10")],
+            vec![v("ANA"), dec("5.5")],
+            vec![v("BIA"), dec("7")]
+        ]
+    );
+    // LEFT: cliente sem pedido aparece com NULL.
+    assert_eq!(
+        q(
+            &b,
+            "SELECT c.nome, p.total FROM clientes c LEFT JOIN pedidos p ON p.cliente_id = c.id ORDER BY c.id, p.id",
+            &[]
+        ),
+        vec![
+            vec![v("ANA"), dec("10")],
+            vec![v("ANA"), dec("5.5")],
+            vec![v("BIA"), dec("7")],
+            vec![v("CAIO"), Valor::Nulo]
+        ]
+    );
+    // WHERE depois do LEFT JOIN, agregação e colunas sem prefixo quando não são ambíguas.
+    assert_eq!(
+        q(
+            &b,
+            "SELECT nome, COUNT(total) AS n, SUM(total) FROM clientes c LEFT JOIN pedidos ON cliente_id = c.id GROUP BY nome HAVING COUNT(*) >= 1 ORDER BY n DESC, nome",
+            &[]
+        ),
+        vec![
+            vec![v("ANA"), v(2), dec("15.5")],
+            vec![v("BIA"), v(1), dec("7")],
+            vec![v("CAIO"), v(0), Valor::Nulo]
+        ]
+    );
+    assert_eq!(
+        q(
+            &b,
+            "SELECT c.id FROM clientes c LEFT JOIN pedidos p ON p.cliente_id = c.id WHERE p.id IS NULL",
+            &[]
+        ),
+        vec![vec![v(3)]]
+    );
+    // Vários JOINs, ON com mais de uma condição, e a tabela duas vezes com apelidos.
+    assert_eq!(
+        q(
+            &b,
+            "SELECT a.nome, b.nome FROM clientes a JOIN clientes b ON a.cidade = b.cidade AND a.id < b.id",
+            &[]
+        ),
+        vec![vec![v("ANA"), v("CAIO")]]
+    );
+    assert_eq!(
+        q(
+            &b,
+            "SELECT c.nome, p.total FROM clientes c JOIN pedidos p ON p.cliente_id = c.id JOIN clientes d ON d.id = c.id WHERE d.cidade = 'SP' AND p.total > 6",
+            &[]
+        ),
+        vec![vec![v("ANA"), dec("10")]]
+    );
+    // SELECT * junta as colunas das duas.
+    let r = consultar(
+        &b.ler().unwrap(),
+        "SELECT * FROM clientes c JOIN pedidos p ON p.cliente_id = c.id WHERE p.id = 3",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(r.colunas.len(), 6);
+    assert_eq!(r.linhas.len(), 1);
+    // AS OF vale para todas as tabelas.
+    exec(
+        &b,
+        "INSERT INTO pedidos (cliente_id, total) VALUES (3, 2)",
+        &[],
+    );
+    let contar = |extra: &str| {
+        q(
+            &b,
+            &format!(
+                "SELECT COUNT(*) FROM clientes c JOIN pedidos p ON p.cliente_id = c.id{extra}"
+            ),
+            &[],
+        )
+    };
+    assert_eq!(
+        contar(" AS OF 1"),
+        vec![vec![v(3)]],
+        "exec roda tudo na confirmação 1"
+    );
+    assert_eq!(contar(""), vec![vec![v(4)]]);
+    // Planos: busca pela chave na esquerda e pelo índice na direita.
+    assert_eq!(
+        plano(
+            &b,
+            "SELECT * FROM clientes c JOIN pedidos p ON p.cliente_id = c.id WHERE c.id = 1",
+            &[]
+        ),
+        "c: busca pela chave primária; p: índice pedidos_cliente"
+    );
+    assert_eq!(
+        plano(
+            &b,
+            "SELECT * FROM pedidos p JOIN clientes c ON c.id = p.cliente_id",
+            &[]
+        ),
+        "p: varredura completa; c: busca pela chave primária"
+    );
+    assert_eq!(
+        plano(
+            &b,
+            "SELECT * FROM pedidos p JOIN clientes c ON c.nome = 'ANA'",
+            &[]
+        ),
+        "p: varredura completa; c: varredura completa"
+    );
+    // Erros.
+    for (sql, trecho) in [
+        (
+            "SELECT id FROM clientes c JOIN pedidos p ON p.cliente_id = c.id",
+            "ambígua",
+        ),
+        (
+            "SELECT * FROM clientes JOIN clientes ON 1 = 1",
+            "duas vezes",
+        ),
+        (
+            "SELECT * FROM clientes c JOIN pedidos p ON x.y = 1",
+            "não existe",
+        ),
+        (
+            "SELECT * FROM clientes c JOIN sys_tabelas s ON 1 = 1",
+            "sys_",
+        ),
+        ("SELECT * FROM clientes LEFT pedidos", "JOIN"),
+    ] {
+        let e = match consultar(&b.ler().unwrap(), sql, &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("{sql} deveria falhar"),
+        };
+        assert!(e.contains(trecho), "{sql}: \"{e}\"");
+    }
+}
+
+/// JOIN aleatório: planejador (chave, índice, varredura) x laço aninhado feito em Rust.
+#[test]
+fn diferencial_join_contra_laco_em_rust() {
+    let (_vfs, b) = banco();
+    exec(
+        &b,
+        "CREATE TABLE a (id INT PRIMARY KEY, k INT, t TEXT); CREATE TABLE b (id INT PRIMARY KEY, k INT, t TEXT);
+         CREATE INDEX b_k ON b (k)",
+        &[],
+    );
+    let mut s = Sorteio(31);
+    let mut gerar = |tabela: &str, n: i64| -> Vec<(i64, Option<i64>, Option<String>)> {
+        let mut v = Vec::new();
+        let mut tx = b.escrever().unwrap();
+        for id in 0..n {
+            let k = (s.ate(5) != 0).then(|| s.ate(8) as i64);
+            let t = (s.ate(4) != 0).then(|| ["x", "y", "z"][s.ate(3) as usize].to_string());
+            executar(
+                &mut tx,
+                &format!("INSERT INTO {tabela} VALUES (?, ?, ?)"),
+                &[
+                    v_(id),
+                    k.map_or(Valor::Nulo, Valor::Inteiro),
+                    t.clone().map_or(Valor::Nulo, Valor::Texto),
+                ],
+            )
+            .unwrap();
+            v.push((id, k, t));
+        }
+        tx.confirmar().unwrap();
+        v
+    };
+    fn v_(i: i64) -> Valor {
+        Valor::Inteiro(i)
+    }
+    let (ta, tb) = (gerar("a", 40), gerar("b", 60));
+    let mut planos = std::collections::HashSet::new();
+    for (juncao, esquerda) in [("JOIN", false), ("LEFT JOIN", true)] {
+        for on in [
+            "a.k = b.k",
+            "b.k = a.k AND a.t = b.t",
+            "a.id = b.id",
+            "b.id = a.k",
+            "a.k < b.k",
+            "a.t = b.t",
+        ] {
+            for filtro in [
+                "",
+                " WHERE b.t = 'x'",
+                " WHERE a.id < 20 AND a.k = 3",
+                " WHERE b.k IS NULL",
+                " WHERE a.id = 7",
+            ] {
+                let sql =
+                    format!("SELECT a.id, b.id FROM a {juncao} b ON {on}{filtro} ORDER BY 1, 2");
+                let obtido: Vec<(i64, Option<i64>)> = q(&b, &sql, &[])
+                    .into_iter()
+                    .map(|l| match (&l[0], &l[1]) {
+                        (Valor::Inteiro(x), Valor::Inteiro(y)) => (*x, Some(*y)),
+                        (Valor::Inteiro(x), Valor::Nulo) => (*x, None),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                let casa =
+                    |x: &(i64, Option<i64>, Option<String>),
+                     y: &(i64, Option<i64>, Option<String>)| match on {
+                        "a.k = b.k" => x.1.is_some() && x.1 == y.1,
+                        "b.k = a.k AND a.t = b.t" => {
+                            x.1.is_some() && x.1 == y.1 && x.2.is_some() && x.2 == y.2
+                        }
+                        "a.id = b.id" => x.0 == y.0,
+                        "b.id = a.k" => x.1 == Some(y.0),
+                        "a.k < b.k" => matches!((x.1, y.1), (Some(p), Some(q)) if p < q),
+                        _ => x.2.is_some() && x.2 == y.2,
+                    };
+                let ok_where =
+                    |x: &(i64, Option<i64>, Option<String>),
+                     y: Option<&(i64, Option<i64>, Option<String>)>| {
+                        match filtro {
+                            "" => true,
+                            " WHERE b.t = 'x'" => y.is_some_and(|y| y.2.as_deref() == Some("x")),
+                            " WHERE a.id < 20 AND a.k = 3" => x.0 < 20 && x.1 == Some(3),
+                            " WHERE a.id = 7" => x.0 == 7,
+                            _ => y.is_none_or(|y| y.1.is_none()),
+                        }
+                    };
+                let mut esperado = Vec::new();
+                for x in &ta {
+                    let mut achou = false;
+                    for y in &tb {
+                        if casa(x, y) {
+                            achou = true;
+                            if ok_where(x, Some(y)) {
+                                esperado.push((x.0, Some(y.0)));
+                            }
+                        }
+                    }
+                    if !achou && esquerda && ok_where(x, None) {
+                        esperado.push((x.0, None));
+                    }
+                }
+                esperado.sort();
+                assert_eq!(obtido, esperado, "{sql}");
+                planos.insert(plano(&b, &sql, &[]));
+            }
+        }
+    }
+    let todos = planos.iter().cloned().collect::<Vec<_>>().join(" | ");
+    for p in [
+        "b: índice b_k",
+        "b: busca pela chave primária",
+        "b: varredura completa",
+        "a: busca pela chave primária",
+        "a: faixa da chave primária",
+    ] {
+        assert!(todos.contains(p), "plano não exercitado: {p}\n{todos}");
+    }
+}
