@@ -33,6 +33,12 @@ pub enum ErroArmazenamento {
     ArquivoTruncado,
     /// Uma confirmação falhou antes; o estado em disco é incerto. Feche e abra de novo.
     ConfirmacaoFalhou,
+    /// O arquivo é cifrado: abra com a senha.
+    SenhaNecessaria,
+    /// Senha errada, ou o cabeçalho foi alterado por quem não tem a chave.
+    SenhaErradaOuAdulterado,
+    /// Erro da criptografia.
+    Cripto(siouxdb_cripto::ErroCripto),
     /// O buffer não tem o tamanho de página do arquivo.
     TamanhoDeBufferErrado {
         /// Tamanho de página do arquivo.
@@ -78,6 +84,11 @@ impl fmt::Display for ErroArmazenamento {
                     "uma confirmação anterior falhou; feche e abra o arquivo de novo"
                 )
             }
+            ErroArmazenamento::SenhaNecessaria => write!(f, "o arquivo é cifrado: informe a senha"),
+            ErroArmazenamento::SenhaErradaOuAdulterado => {
+                write!(f, "senha errada ou cabeçalho alterado")
+            }
+            ErroArmazenamento::Cripto(e) => write!(f, "{e}"),
             ErroArmazenamento::TamanhoDeBufferErrado { esperado, recebido } => {
                 write!(f, "buffer de {recebido} bytes, a página tem {esperado}")
             }
@@ -89,6 +100,7 @@ impl std::error::Error for ErroArmazenamento {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ErroArmazenamento::Vfs(e) => Some(e),
+            ErroArmazenamento::Cripto(e) => Some(e),
             _ => None,
         }
     }
@@ -97,5 +109,16 @@ impl std::error::Error for ErroArmazenamento {
 impl From<ErroVfs> for ErroArmazenamento {
     fn from(e: ErroVfs) -> Self {
         ErroArmazenamento::Vfs(e)
+    }
+}
+
+impl From<siouxdb_cripto::ErroCripto> for ErroArmazenamento {
+    fn from(e: siouxdb_cripto::ErroCripto) -> Self {
+        match e {
+            siouxdb_cripto::ErroCripto::SenhaErradaOuAdulterado => {
+                ErroArmazenamento::SenhaErradaOuAdulterado
+            }
+            outro => ErroArmazenamento::Cripto(outro),
+        }
     }
 }

@@ -27,6 +27,8 @@
 
   <form class="barra-arquivo" id="barra-arquivo" hidden>
     <label>Arquivo <input id="caminho" type="text" placeholder="/caminho/para/banco.sdb" autocomplete="off" spellcheck="false"></label>
+    <label>Senha <input id="senha" type="password" autocomplete="off" placeholder="se o arquivo for cifrado"></label>
+    <label id="rotulo-sem-cifra" class="marcar" hidden><input id="sem-cifra" type="checkbox"> Sem cifra</label>
     <label id="rotulo-kb" hidden>Página
       <select id="kb"><option>4</option><option selected>8</option><option>16</option><option>32</option></select> KiB
     </label>

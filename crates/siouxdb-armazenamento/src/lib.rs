@@ -7,7 +7,9 @@
 //! - [`CacheSieve`]: cache com o algoritmo de descarte SIEVE;
 //! - [`Paginador`]: junta tudo: cria e abre arquivos, aloca, lê, grava e confirma páginas.
 //!
-//! A cifra por página entra no marco M2, por cima deste formato (ver `spec/FORMATO.md`).
+//! Arquivo cifrado (opcional nesta camada): cada página é cifrada com XChaCha20-Poly1305
+//! pela chave do arquivo, que fica no cabeçalho embrulhada pela chave da senha (Argon2id).
+//! O cabeçalho continua legível, mas é autenticado. Ver `spec/FORMATO.md`.
 
 mod cabecalho;
 mod cache;
@@ -16,12 +18,13 @@ mod erro;
 mod pagina;
 mod paginador;
 
-pub use cabecalho::{Cabecalho, TAMANHO_CABECALHO};
+pub use cabecalho::{Cabecalho, Protecao, TAMANHO_CABECALHO};
 pub use cache::{CacheSieve, EstatisticasCache};
 pub use crc::crc32c;
 pub use erro::{ErroArmazenamento, Resultado};
 pub use pagina::{CABECALHO_PAGINA, Pagina, TipoPagina};
-pub use paginador::{EstatisticasPaginador, Paginador};
+pub use paginador::{EstatisticasPaginador, Paginador, SenhaNova};
+pub use siouxdb_cripto::ParametrosSenha;
 
 /// Número de uma página dentro do arquivo (a página 0 começa no byte 0).
 pub type NumeroPagina = u64;

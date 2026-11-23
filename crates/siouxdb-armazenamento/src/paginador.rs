@@ -19,9 +19,14 @@
 //! é cortada no ponto do problema. Perde-se espaço (recuperável por compactação), mas uma
 //! página em uso nunca é entregue como livre.
 
+use crate::Protecao;
 use crate::{
     Cabecalho, CacheSieve, ErroArmazenamento, EstatisticasCache, NumeroPagina, PAGINAS_RESERVADAS,
     Pagina, Resultado, TAMANHO_CABECALHO, TamanhoPagina, TipoPagina,
+};
+use siouxdb_cripto::{
+    Chave, CifraPagina, ParametrosSenha, SOBRA_CIFRA, TAMANHO_NONCE, TAMANHO_TAG, derivar_da_senha,
+    desembrulhar, embrulhar, sal_aleatorio,
 };
 use siouxdb_metricas::{FotoHistograma, Histograma, Leitura};
 use siouxdb_vfs::{Arquivo, ModoAbertura, Vfs};
@@ -60,10 +65,32 @@ struct Estado {
     falhou: bool,
 }
 
+/// Senha e custo para criar (ou trocar a senha de) um arquivo cifrado.
+#[derive(Clone, Copy)]
+pub struct SenhaNova<'a> {
+    /// A senha.
+    pub senha: &'a [u8],
+    /// Custo do Argon2id.
+    pub parametros: ParametrosSenha,
+}
+
+impl std::fmt::Debug for SenhaNova<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SenhaNova")
+            .field("senha", &"***")
+            .field("parametros", &self.parametros)
+            .finish()
+    }
+}
+
 /// Dono do arquivo do banco. Pode ser compartilhado entre threads.
 pub struct Paginador<A: Arquivo> {
     arquivo: A,
     tamanho: TamanhoPagina,
+    /// Bytes úteis da página (menos o que a cifra ocupa, se cifrado).
+    util: usize,
+    /// Chave do arquivo e a cifra montada com ela (`None` = arquivo em claro).
+    chave: Option<(Chave, CifraPagina)>,
     estado: Mutex<Estado>,
     cache: Mutex<CacheSieve<NumeroPagina, Arc<Pagina>>>,
     leituras_de_disco: AtomicU64,
@@ -74,30 +101,88 @@ pub struct Paginador<A: Arquivo> {
 }
 
 impl<A: Arquivo> Paginador<A> {
-    /// Cria um arquivo novo (falha se já existir).
+    /// Cria um arquivo novo **em claro** (falha se já existir).
     pub fn criar<V: Vfs<Arquivo = A>>(
         vfs: &V,
         caminho: &Path,
         tamanho: TamanhoPagina,
         capacidade_cache: usize,
     ) -> Resultado<Self> {
-        let arquivo = vfs.abrir(caminho, ModoAbertura::CriarNovo)?;
-        let tam = tamanho.bytes();
-        let mut inicio = vec![0u8; tam * PAGINAS_RESERVADAS as usize];
-        let mut cabecalho = Cabecalho::novo(tamanho);
-        inicio[..TAMANHO_CABECALHO].copy_from_slice(&cabecalho.codificar());
-        cabecalho.geracao = 1;
-        inicio[tam..tam + TAMANHO_CABECALHO].copy_from_slice(&cabecalho.codificar());
-        arquivo.gravar_em(0, &inicio)?;
-        arquivo.sincronizar()?;
-        Ok(Self::montar(arquivo, cabecalho, capacidade_cache))
+        Self::criar_com(vfs, caminho, tamanho, capacidade_cache, None)
     }
 
-    /// Abre um arquivo existente. Vale a cópia íntegra do cabeçalho de maior geração.
+    /// Cria um arquivo novo, cifrado se `senha` vier (falha se já existir).
+    ///
+    /// A chave do arquivo é sorteada e guardada no cabeçalho embrulhada pela chave derivada
+    /// da senha (Argon2id).
+    pub fn criar_com<V: Vfs<Arquivo = A>>(
+        vfs: &V,
+        caminho: &Path,
+        tamanho: TamanhoPagina,
+        capacidade_cache: usize,
+        senha: Option<SenhaNova<'_>>,
+    ) -> Resultado<Self> {
+        // A parte cara (Argon2id) vem antes de criar o arquivo: erro de parâmetro não deixa lixo.
+        let (protecao, chave) = match senha {
+            None => (None, None),
+            Some(s) => {
+                let chave = Chave::aleatoria()?;
+                let protecao = Self::proteger(&chave, tamanho, s)?;
+                (Some(protecao), Some(chave))
+            }
+        };
+        let arquivo = vfs.abrir(caminho, ModoAbertura::CriarNovo)?;
+        let tam = tamanho.bytes();
+        let mut cabecalho = Cabecalho::novo(tamanho, protecao);
+        let chave = chave.map(|c| {
+            let cifra = CifraPagina::nova(c.clone());
+            (c, cifra)
+        });
+        let cifra = chave.as_ref().map(|(_, c)| c);
+        let mut inicio = vec![0u8; tam * PAGINAS_RESERVADAS as usize];
+        inicio[..TAMANHO_CABECALHO].copy_from_slice(&cabecalho.codificar(cifra)?);
+        cabecalho.geracao = 1;
+        let copia_b = cabecalho.codificar(cifra)?;
+        inicio[tam..tam + TAMANHO_CABECALHO].copy_from_slice(&copia_b);
+        // Em memória fica exatamente o que foi gravado (inclusive a etiqueta).
+        let cabecalho = Cabecalho::decodificar(&copia_b)?;
+        arquivo.gravar_em(0, &inicio)?;
+        arquivo.sincronizar()?;
+        Ok(Self::montar(arquivo, cabecalho, capacidade_cache, chave))
+    }
+
+    fn proteger(chave: &Chave, tamanho: TamanhoPagina, s: SenhaNova<'_>) -> Resultado<Protecao> {
+        let sal = sal_aleatorio()?;
+        let kek = derivar_da_senha(s.senha, &sal, s.parametros)?;
+        let contexto = Cabecalho::contexto_da_chave(tamanho, s.parametros, &sal);
+        let embrulhada = embrulhar(&kek, chave, &contexto)?;
+        Ok(Protecao {
+            parametros: s.parametros,
+            sal,
+            embrulhada,
+        })
+    }
+
+    /// Abre um arquivo existente **em claro**. Arquivo cifrado dá
+    /// [`ErroArmazenamento::SenhaNecessaria`]: use [`Paginador::abrir_com`].
     pub fn abrir<V: Vfs<Arquivo = A>>(
         vfs: &V,
         caminho: &Path,
         capacidade_cache: usize,
+    ) -> Resultado<Self> {
+        Self::abrir_com(vfs, caminho, capacidade_cache, None)
+    }
+
+    /// Abre um arquivo existente, com a senha se for cifrado.
+    ///
+    /// Vale a cópia do cabeçalho com CRC íntegro de maior geração. Num arquivo cifrado essa
+    /// cópia **precisa** autenticar com a chave; se não autenticar, é erro (nunca se volta
+    /// para a cópia anterior por isso, para não abrir com uma senha já trocada).
+    pub fn abrir_com<V: Vfs<Arquivo = A>>(
+        vfs: &V,
+        caminho: &Path,
+        capacidade_cache: usize,
+        senha: Option<&[u8]>,
     ) -> Resultado<Self> {
         let arquivo = vfs.abrir(caminho, ModoAbertura::LeituraGravacao)?;
         let tamanho_arquivo = arquivo.tamanho()?;
@@ -140,16 +225,40 @@ impl<A: Arquivo> Paginador<A> {
             .total_paginas
             .checked_mul(cabecalho.tamanho_pagina.bytes() as u64)
             .ok_or(ErroArmazenamento::CabecalhoCorrompido)?;
+        let chave = match &cabecalho.protecao {
+            None => None,
+            Some(p) => {
+                let senha = senha.ok_or(ErroArmazenamento::SenhaNecessaria)?;
+                let kek = derivar_da_senha(senha, &p.sal, p.parametros)?;
+                let contexto =
+                    Cabecalho::contexto_da_chave(cabecalho.tamanho_pagina, p.parametros, &p.sal);
+                let chave = desembrulhar(&kek, &p.embrulhada, &contexto)?;
+                let cifra = CifraPagina::nova(chave.clone());
+                if !cabecalho.autentico(&cifra) {
+                    return Err(ErroArmazenamento::SenhaErradaOuAdulterado);
+                }
+                Some((chave, cifra))
+            }
+        };
         if tamanho_arquivo < minimo {
             return Err(ErroArmazenamento::ArquivoTruncado);
         }
-        Ok(Self::montar(arquivo, cabecalho, capacidade_cache))
+        Ok(Self::montar(arquivo, cabecalho, capacidade_cache, chave))
     }
 
-    fn montar(arquivo: A, cabecalho: Cabecalho, capacidade_cache: usize) -> Self {
+    fn montar(
+        arquivo: A,
+        cabecalho: Cabecalho,
+        capacidade_cache: usize,
+        chave: Option<(Chave, CifraPagina)>,
+    ) -> Self {
+        let tamanho = cabecalho.tamanho_pagina;
+        let util = tamanho.bytes() - if chave.is_some() { SOBRA_CIFRA } else { 0 };
         Paginador {
             arquivo,
-            tamanho: cabecalho.tamanho_pagina,
+            tamanho,
+            util,
+            chave,
             estado: Mutex::new(Estado {
                 cabecalho,
                 liberadas: Vec::new(),
@@ -169,6 +278,34 @@ impl<A: Arquivo> Paginador<A> {
         self.tamanho
     }
 
+    /// Bytes que uma [`Pagina`] deste arquivo tem (menor que a página se o arquivo é cifrado).
+    pub fn tamanho_util(&self) -> usize {
+        self.util
+    }
+
+    /// O arquivo é cifrado?
+    pub fn cifrado(&self) -> bool {
+        self.chave.is_some()
+    }
+
+    /// Troca a senha (e, se quiser, o custo do Argon2id). Só reembrulha a chave do arquivo:
+    /// nenhuma página é recifrada. Confirma duas vezes, para que **as duas** cópias do
+    /// cabeçalho fiquem com a senha nova e a antiga não abra mais nada.
+    pub fn trocar_senha(&self, nova: SenhaNova<'_>) -> Resultado<()> {
+        let (chave, _) = self
+            .chave
+            .as_ref()
+            .ok_or(ErroArmazenamento::SenhaNecessaria)?;
+        let protecao = Self::proteger(chave, self.tamanho, nova)?;
+        self.estado_usavel()?.cabecalho.protecao = Some(protecao);
+        self.confirmar()?;
+        self.confirmar()
+    }
+
+    fn cifra(&self) -> Option<&CifraPagina> {
+        self.chave.as_ref().map(|(_, c)| c)
+    }
+
     /// Cópia do cabeçalho como está em memória (inclui o que ainda não foi confirmado).
     pub fn cabecalho(&self) -> Cabecalho {
         self.travar_estado().cabecalho.clone()
@@ -176,7 +313,7 @@ impl<A: Arquivo> Paginador<A> {
 
     /// Página zerada do tamanho deste arquivo, pronta para preencher e gravar.
     pub fn pagina_nova(&self, tipo: TipoPagina) -> Pagina {
-        Pagina::nova(self.tamanho, tipo)
+        Pagina::nova(self.util, tipo)
     }
 
     /// Define a página raiz do catálogo (vale a partir da próxima confirmação).
@@ -223,7 +360,7 @@ impl<A: Arquivo> Paginador<A> {
             };
             match proxima {
                 Some(prox) => {
-                    self.gravar_sem_conferir_limites(n, Pagina::nova(self.tamanho, tipo))?;
+                    self.gravar_sem_conferir_limites(n, Pagina::nova(self.util, tipo))?;
                     e.cabecalho.primeira_livre = prox;
                     return Ok(n);
                 }
@@ -232,7 +369,7 @@ impl<A: Arquivo> Paginador<A> {
             }
         }
         let n = e.cabecalho.total_paginas;
-        self.gravar_sem_conferir_limites(n, Pagina::nova(self.tamanho, tipo))?;
+        self.gravar_sem_conferir_limites(n, Pagina::nova(self.util, tipo))?;
         e.cabecalho.total_paginas = n + 1;
         Ok(n)
     }
@@ -253,9 +390,9 @@ impl<A: Arquivo> Paginador<A> {
     fn gravar_sem_medir(&self, numero: NumeroPagina, pagina: Pagina) -> Resultado<()> {
         let e = self.estado_usavel()?;
         self.conferir_limites(&e, numero)?;
-        if pagina.tamanho() != self.tamanho.bytes() {
+        if pagina.tamanho() != self.util {
             return Err(ErroArmazenamento::TamanhoDeBufferErrado {
-                esperado: self.tamanho.bytes(),
+                esperado: self.util,
                 recebido: pagina.tamanho(),
             });
         }
@@ -313,9 +450,9 @@ impl<A: Arquivo> Paginador<A> {
     fn gravar_proximo_cabecalho(&self, atual: &Cabecalho) -> Resultado<Cabecalho> {
         let mut novo = atual.clone();
         novo.geracao += 1;
-        self.arquivo
-            .gravar_em(novo.posicao_da_copia(), &novo.codificar())?;
-        Ok(novo)
+        let bytes = novo.codificar(self.cifra())?;
+        self.arquivo.gravar_em(novo.posicao_da_copia(), &bytes)?;
+        Cabecalho::decodificar(&bytes)
     }
 
     /// Depois de confirmado, as páginas liberadas não são mais referenciadas por nenhum
@@ -323,7 +460,7 @@ impl<A: Arquivo> Paginador<A> {
     /// resto fica fora da lista (perde espaço, não perde dado).
     fn encadear_liberadas(&self, e: &mut Estado) {
         for n in std::mem::take(&mut e.liberadas) {
-            let mut livre = Pagina::nova(self.tamanho, TipoPagina::Livre);
+            let mut livre = Pagina::nova(self.util, TipoPagina::Livre);
             livre.conteudo_mut()[..8].copy_from_slice(&e.cabecalho.primeira_livre.to_le_bytes());
             if self.gravar_sem_conferir_limites(n, livre).is_err() {
                 break;
@@ -418,6 +555,13 @@ impl<A: Arquivo> Paginador<A> {
         if lidos < dados.len() {
             return Err(ErroArmazenamento::PaginaCorrompida(numero));
         }
+        if let Some(cifra) = self.cifra() {
+            // Gravação cortada por queda também cai aqui: para quem lê é igual a adulterada.
+            cifra
+                .decifrar(numero, crate::VERSAO_FORMATO, &mut dados)
+                .map_err(|_| ErroArmazenamento::PaginaCorrompida(numero))?;
+            dados = dados[TAMANHO_NONCE..dados.len() - TAMANHO_TAG].into();
+        }
         let pagina = Arc::new(Pagina::de_bytes(dados, numero)?);
         self.travar_cache().inserir(numero, Arc::clone(&pagina));
         Ok(pagina)
@@ -428,9 +572,18 @@ impl<A: Arquivo> Paginador<A> {
         numero: NumeroPagina,
         mut pagina: Pagina,
     ) -> Resultado<()> {
-        let resultado = self
-            .arquivo
-            .gravar_em(self.posicao(numero), pagina.selar(numero));
+        let resultado = match self.cifra() {
+            None => self
+                .arquivo
+                .gravar_em(self.posicao(numero), pagina.selar(numero)),
+            Some(cifra) => {
+                let mut disco = vec![0u8; self.tamanho.bytes()];
+                disco[TAMANHO_NONCE..TAMANHO_NONCE + self.util]
+                    .copy_from_slice(pagina.selar(numero));
+                cifra.cifrar(numero, crate::VERSAO_FORMATO, &mut disco)?;
+                self.arquivo.gravar_em(self.posicao(numero), &disco)
+            }
+        };
         self.gravacoes.fetch_add(1, Ordering::Relaxed);
         let mut cache = self.travar_cache();
         match resultado {
@@ -474,6 +627,143 @@ mod testes {
 
     fn texto(p: &Pagina, tamanho: usize) -> Vec<u8> {
         p.conteudo()[..tamanho].to_vec()
+    }
+
+    const SENHA: &[u8] = b"senha de teste";
+
+    fn criar(vfs: &VfsSimulado, tamanho: TamanhoPagina, cache: usize, cifrado: bool) -> Pag {
+        let senha = cifrado.then_some(SenhaNova {
+            senha: SENHA,
+            parametros: ParametrosSenha::para_testes(),
+        });
+        Pag::criar_com(vfs, &caminho(), tamanho, cache, senha).unwrap()
+    }
+
+    fn abrir(vfs: &VfsSimulado, cache: usize, cifrado: bool) -> Pag {
+        Pag::abrir_com(vfs, &caminho(), cache, cifrado.then_some(SENHA)).unwrap()
+    }
+
+    fn bytes_do_arquivo(vfs: &VfsSimulado) -> Vec<u8> {
+        let arq = vfs.abrir(&caminho(), ModoAbertura::Leitura).unwrap();
+        let mut b = vec![0u8; arq.tamanho().unwrap() as usize];
+        arq.ler_exato_em(0, &mut b).unwrap();
+        b
+    }
+
+    #[test]
+    fn cifrado_nao_vaza_e_exige_a_senha_certa() {
+        let vfs = disco(1);
+        let p = criar(&vfs, TamanhoPagina::K4, 8, true);
+        assert!(p.cifrado());
+        assert_eq!(p.tamanho_util(), 4096 - SOBRA_CIFRA);
+        let n = p.alocar(TipoPagina::Catalogo).unwrap();
+        p.gravar(n, com_texto(&p, TipoPagina::Catalogo, b"segredo-da-sioux"))
+            .unwrap();
+        assert!(matches!(
+            p.gravar(n, Pagina::nova(4096, TipoPagina::Catalogo)),
+            Err(ErroArmazenamento::TamanhoDeBufferErrado { .. })
+        ));
+        p.definir_raiz_catalogo(n).unwrap();
+        p.confirmar().unwrap();
+        drop(p);
+
+        let bruto = bytes_do_arquivo(&vfs);
+        assert!(
+            !bruto.windows(16).any(|w| w == b"segredo-da-sioux"),
+            "texto em claro no arquivo"
+        );
+        assert!(matches!(
+            Pag::abrir(&vfs, &caminho(), 8),
+            Err(ErroArmazenamento::SenhaNecessaria)
+        ));
+        assert!(matches!(
+            Pag::abrir_com(&vfs, &caminho(), 8, Some(b"errada")),
+            Err(ErroArmazenamento::SenhaErradaOuAdulterado)
+        ));
+        let p = abrir(&vfs, 8, true);
+        assert_eq!(texto(&p.ler(n).unwrap(), 16), b"segredo-da-sioux");
+    }
+
+    #[test]
+    fn cifrado_detecta_pagina_trocada_e_cabecalho_alterado() {
+        let vfs = disco(1);
+        let p = criar(&vfs, TamanhoPagina::K4, 8, true);
+        let a = p.alocar(TipoPagina::Catalogo).unwrap();
+        let b = p.alocar(TipoPagina::Catalogo).unwrap();
+        p.gravar(a, com_texto(&p, TipoPagina::Catalogo, b"pagina-a"))
+            .unwrap();
+        p.gravar(b, com_texto(&p, TipoPagina::Catalogo, b"pagina-b"))
+            .unwrap();
+        p.confirmar().unwrap();
+        drop(p);
+
+        // Copia a página A por cima da B (bytes cifrados válidos, mas do lugar errado).
+        let bruto = bytes_do_arquivo(&vfs);
+        let arq = vfs
+            .abrir(&caminho(), ModoAbertura::LeituraGravacao)
+            .unwrap();
+        let pa = &bruto[a as usize * 4096..(a as usize + 1) * 4096];
+        arq.gravar_em(b * 4096, pa).unwrap();
+        let p = abrir(&vfs, 8, true);
+        assert_eq!(texto(&p.ler(a).unwrap(), 8), b"pagina-a");
+        assert!(matches!(
+            p.ler(b),
+            Err(ErroArmazenamento::PaginaCorrompida(_))
+        ));
+        let geracao = p.cabecalho().geracao;
+        drop(p);
+
+        // Muda o total de páginas da cópia em vigor e recalcula o CRC: não abre.
+        let pos = Cabecalho::posicao(geracao % 2 == 1, TamanhoPagina::K4) as usize;
+        let mut cab = bytes_do_arquivo(&vfs)[pos..pos + TAMANHO_CABECALHO].to_vec();
+        cab[24] = 3;
+        let crc = crate::crc32c(&cab[..TAMANHO_CABECALHO - 4]);
+        cab[TAMANHO_CABECALHO - 4..].copy_from_slice(&crc.to_le_bytes());
+        arq.gravar_em(pos as u64, &cab).unwrap();
+        assert!(matches!(
+            Pag::abrir_com(&vfs, &caminho(), 8, Some(SENHA)),
+            Err(ErroArmazenamento::SenhaErradaOuAdulterado)
+        ));
+    }
+
+    #[test]
+    fn trocar_senha_invalida_a_antiga_nas_duas_copias() {
+        let vfs = disco(1);
+        let p = criar(&vfs, TamanhoPagina::K4, 8, true);
+        let n = p.alocar(TipoPagina::Catalogo).unwrap();
+        p.gravar(n, com_texto(&p, TipoPagina::Catalogo, b"dado"))
+            .unwrap();
+        p.trocar_senha(SenhaNova {
+            senha: b"nova",
+            parametros: ParametrosSenha::para_testes(),
+        })
+        .unwrap();
+        drop(p);
+        assert!(Pag::abrir_com(&vfs, &caminho(), 8, Some(SENHA)).is_err());
+        let p = Pag::abrir_com(&vfs, &caminho(), 8, Some(b"nova")).unwrap();
+        assert_eq!(texto(&p.ler(n).unwrap(), 4), b"dado");
+        drop(p);
+        // Mesmo estragando a cópia em vigor, a outra também já está com a senha nova.
+        let p = Pag::abrir_com(&vfs, &caminho(), 8, Some(b"nova")).unwrap();
+        let g = p.cabecalho().geracao;
+        drop(p);
+        let arq = vfs
+            .abrir(&caminho(), ModoAbertura::LeituraGravacao)
+            .unwrap();
+        arq.gravar_em(Cabecalho::posicao(g % 2 == 1, TamanhoPagina::K4), &[0; 64])
+            .unwrap();
+        assert!(Pag::abrir_com(&vfs, &caminho(), 8, Some(SENHA)).is_err());
+        assert!(Pag::abrir_com(&vfs, &caminho(), 8, Some(b"nova")).is_ok());
+        // Arquivo em claro não tem senha para trocar.
+        let vfs = disco(2);
+        let p = criar(&vfs, TamanhoPagina::K4, 8, false);
+        assert!(matches!(
+            p.trocar_senha(SenhaNova {
+                senha: b"x",
+                parametros: ParametrosSenha::para_testes()
+            }),
+            Err(ErroArmazenamento::SenhaNecessaria)
+        ));
     }
 
     #[test]
@@ -606,9 +896,9 @@ mod testes {
 
     #[test]
     fn queda_antes_de_confirmar_volta_ao_estado_confirmado() {
-        for semente in 0..200 {
+        for (semente, cifrado) in (0..200u64).flat_map(|s| [(s, false), (s, true)]) {
             let vfs = disco(semente);
-            let p = Pag::criar(&vfs, &caminho(), TamanhoPagina::K4, 8).unwrap();
+            let p = criar(&vfs, TamanhoPagina::K4, 8, cifrado);
             let a = p.alocar(TipoPagina::NoArvore).unwrap();
             p.gravar(a, com_texto(&p, TipoPagina::NoArvore, b"confirmado"))
                 .unwrap();
@@ -625,8 +915,12 @@ mod testes {
             drop(p);
             vfs.queda();
 
-            let p = Pag::abrir(&vfs, &caminho(), 8).unwrap();
-            assert_eq!(p.cabecalho(), confirmado, "semente {semente}");
+            let p = abrir(&vfs, 8, cifrado);
+            assert_eq!(
+                p.cabecalho(),
+                confirmado,
+                "semente {semente} (cifrado: {cifrado})"
+            );
             assert_eq!(texto(&p.ler(a).unwrap(), 10), b"confirmado");
             assert!(p.ler(a + 1).is_err());
             // O arquivo continua utilizável.
@@ -639,9 +933,9 @@ mod testes {
     #[test]
     fn sobrescrita_sem_confirmar_nunca_vira_lixo_aceito() {
         let (mut antigas, mut novas, mut erros) = (0, 0, 0);
-        for semente in 0..300 {
+        for (semente, cifrado) in (0..300u64).flat_map(|s| [(s, false), (s, true)]) {
             let vfs = disco(semente);
-            let p = Pag::criar(&vfs, &caminho(), TamanhoPagina::K8, 8).unwrap();
+            let p = criar(&vfs, TamanhoPagina::K8, 8, cifrado);
             let n = p.alocar(TipoPagina::NoArvore).unwrap();
             p.gravar(n, com_texto(&p, TipoPagina::NoArvore, &[0xAA; 8000]))
                 .unwrap();
@@ -651,13 +945,15 @@ mod testes {
             drop(p);
             vfs.queda();
 
-            let p = Pag::abrir(&vfs, &caminho(), 8).unwrap();
+            let p = abrir(&vfs, 8, cifrado);
             match p.ler(n) {
                 Ok(pagina) if texto(&pagina, 8000) == [0xAA; 8000] => antigas += 1,
                 Ok(pagina) if texto(&pagina, 8000) == [0xBB; 8000] => novas += 1,
-                Ok(_) => panic!("semente {semente}: página misturada foi aceita"),
+                Ok(_) => {
+                    panic!("semente {semente} (cifrado: {cifrado}): página misturada foi aceita")
+                }
                 Err(ErroArmazenamento::PaginaCorrompida(_)) => erros += 1,
-                Err(e) => panic!("semente {semente}: erro inesperado: {e}"),
+                Err(e) => panic!("semente {semente} (cifrado: {cifrado}): erro inesperado: {e}"),
             }
         }
         assert!(
@@ -671,9 +967,9 @@ mod testes {
     #[test]
     fn alteracao_por_copia_e_tudo_ou_nada() {
         let (mut ficou_na_antiga, mut foi_para_a_nova) = (0, 0);
-        for semente in 0..400u64 {
+        for (semente, cifrado) in (0..400u64).flat_map(|s| [(s, false), (s, true)]) {
             let vfs = disco(semente);
-            let p = Pag::criar(&vfs, &caminho(), TamanhoPagina::K4, 8).unwrap();
+            let p = criar(&vfs, TamanhoPagina::K4, 8, cifrado);
             let mut raiz = p.alocar(TipoPagina::Catalogo).unwrap();
             p.gravar(raiz, com_texto(&p, TipoPagina::Catalogo, b"versao-000"))
                 .unwrap();
@@ -716,7 +1012,7 @@ mod testes {
             drop(p);
             vfs.queda();
 
-            let p = Pag::abrir(&vfs, &caminho(), 8).unwrap();
+            let p = abrir(&vfs, 8, cifrado);
             let lida = p.ler(p.cabecalho().raiz_catalogo).unwrap();
             let conteudo = texto(&lida, 10);
             if conteudo == format!("versao-{versao:03}").as_bytes() {
@@ -725,7 +1021,7 @@ mod testes {
                 foi_para_a_nova += 1;
             } else {
                 panic!(
-                    "semente {semente}: raiz aponta para {:?}",
+                    "semente {semente} (cifrado: {cifrado}): raiz aponta para {:?}",
                     String::from_utf8_lossy(&conteudo)
                 );
             }
@@ -735,7 +1031,7 @@ mod testes {
                 assert_ne!(
                     n,
                     p.cabecalho().raiz_catalogo,
-                    "semente {semente}: página em uso entregue como livre"
+                    "semente {semente} (cifrado: {cifrado}): página em uso entregue como livre"
                 );
             }
             p.confirmar().unwrap();

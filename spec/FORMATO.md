@@ -42,27 +42,39 @@ Página **livre**: os 8 primeiros bytes do conteúdo apontam para a próxima liv
 ### Confirmação
 1. `fsync` das páginas; 2. cabeçalho da geração seguinte na cópia mais antiga; 3. `fsync`. Se um `fsync` falhar, o paginador recusa novas operações até o arquivo ser reaberto.
 
-## Página com cifra (planejado para o M2)
-- Tamanho padrão **8 KiB**, escolhido na criação (4, 8, 16 ou 32 KiB) e fixo depois.
-- Toda leitura e gravação é alinhada ao tamanho da página.
-- Layout lógico de uma página gravada:
+## Arquivo cifrado (implementado no M2, `siouxdb-cripto`)
 
-| Campo | Tamanho | Observação |
-|---|---|---|
-| nonce | 24 bytes | aleatório a cada gravação (XChaCha20-Poly1305) |
-| conteúdo cifrado | página − 24 − 16 | inclui o cabeçalho da página |
-| tag | 16 bytes | autenticação |
+Cifrado é o padrão da CLI (`sioux criar`); `--sem-cifra` cria em claro.
 
-- **Dados associados (AAD)** da cifra: número da página e versão do formato. Uma página copiada para outra posição falha na autenticação.
-- Cabeçalho da página (dentro da parte cifrada): tipo, número, LSN da última alteração, CRC32C do conteúdo.
+### Campos extras do cabeçalho
+| Bytes | Campo |
+|---|---|
+| 64 | cifra: 0 nenhuma, 1 XChaCha20-Poly1305 |
+| 65..68 | reservado |
+| 68..72 | Argon2id: memória (KiB) |
+| 72..76 | Argon2id: iterações |
+| 76..80 | Argon2id: paralelismo |
+| 80..96 | sal (16 bytes) |
+| 96..168 | chave do arquivo embrulhada: nonce 24 + chave cifrada 32 + etiqueta 16 |
+| 168..208 | **autenticação do cabeçalho**: nonce 24 + etiqueta 16 sobre os bytes 0..168, com a chave do arquivo |
 
-## Cabeçalho do arquivo
-Duas cópias (A na página 0, B na página 1), gravadas alternadamente; vale a de maior **geração** com CRC válido. Contém:
-- assinatura mágica `SIOUXDB\0` e versão do formato (em claro, para identificar o arquivo);
-- tamanho da página;
-- sal e parâmetros do Argon2id;
-- chave do arquivo embrulhada pela chave do usuário (envelope);
-- raiz do catálogo, raiz do ledger, último LSN confirmado.
+- A chave do arquivo (256 bits) é sorteada na criação. A chave da senha vem do **Argon2id** (padrão 64 MiB, 3 iterações, 1 linha) e embrulha a do arquivo com XChaCha20-Poly1305.
+- Os **dados associados** do embrulho são assinatura, versão, tamanho da página, tipo de cifra, parâmetros do Argon2id e sal: alterar qualquer um deles impede desembrulhar.
+- O cabeçalho fica legível (é preciso para derivar a chave), mas a **cópia em vigor precisa autenticar**; se não autenticar, o arquivo não abre (não se volta para a cópia anterior por isso).
+- **Trocar a senha** reembrulha a chave e grava as **duas** cópias; a senha antiga deixa de abrir.
+
+### Página cifrada
+| Bytes | Campo |
+|---|---|
+| 0..24 | nonce, sorteado a cada gravação |
+| 24..n−16 | página lógica cifrada (o layout em claro descrito acima, com n−40 bytes) |
+| n−16..n | etiqueta Poly1305 |
+
+Dados associados: `"SIOUXPAG"` + número da página (u64) + versão do formato (u32). Página copiada para outra posição, alterada, cortada por queda ou de outro arquivo **não decifra** e é tratada como corrompida.
+
+### Limites conhecidos (resolvidos em marcos seguintes)
+- **Reversão de página**: trocar uma página pela versão antiga **da mesma posição** (de uma cópia antiga do arquivo) ainda passa. A cadeia de hashes do livro-razão (M6) fecha isso.
+- O cabeçalho revela, em claro, tamanho de página, número de páginas e raízes (não o conteúdo).
 
 ## Tipos de página (planejados)
 catálogo · log da camada quente · nó de B+tree · bloco frio em colunas · resumo de bloco · lista de páginas livres · ledger.

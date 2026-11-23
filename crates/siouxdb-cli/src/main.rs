@@ -2,17 +2,26 @@
 //!
 //! ```text
 //! sioux --version
-//! sioux criar <arquivo> [--pagina 4|8|16|32]
+//! sioux criar <arquivo> [--pagina 4|8|16|32] [--sem-cifra]
 //! sioux info  <arquivo>
 //! sioux verificar <arquivo>
+//! sioux trocar-senha <arquivo>
 //! ```
+//!
+//! Arquivos novos são **cifrados por padrão**. A senha é pedida no terminal (sem eco) ou
+//! lida da variável `SIOUX_SENHA` (para scripts; a nova senha de `trocar-senha` vem de
+//! `SIOUX_SENHA_NOVA`).
 
-use siouxdb::armazenamento::{ErroArmazenamento, Paginador, TamanhoPagina};
+use siouxdb::armazenamento::{
+    ErroArmazenamento, PAGINAS_RESERVADAS, Paginador, ParametrosSenha, SenhaNova, TamanhoPagina,
+};
 use siouxdb::vfs::{Vfs, VfsReal};
 use std::path::Path;
 use std::process::ExitCode;
 
 type Pag = Paginador<<VfsReal as Vfs>::Arquivo>;
+
+const CACHE: usize = 64;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -29,6 +38,7 @@ fn main() -> ExitCode {
         ["criar", arquivo, resto @ ..] => criar(arquivo, resto),
         ["info", arquivo] => info(arquivo),
         ["verificar", arquivo] => verificar(arquivo),
+        ["trocar-senha", arquivo] => trocar_senha(arquivo),
         _ => {
             ajuda();
             return ExitCode::from(2);
@@ -51,37 +61,131 @@ fn ajuda() {
     println!();
     println!("Uso:");
     println!("  sioux --version");
-    println!("  sioux criar <arquivo> [--pagina 4|8|16|32]   cria um banco vazio");
-    println!("  sioux info <arquivo>                         mostra o cabeçalho");
-    println!("  sioux verificar <arquivo>                    lê e confere todas as páginas");
+    println!(
+        "  sioux criar <arquivo> [--pagina 4|8|16|32] [--sem-cifra]   cria um banco vazio (cifrado por padrão)"
+    );
+    println!("  sioux info <arquivo>                                      mostra o cabeçalho");
+    println!(
+        "  sioux verificar <arquivo>                                 lê e confere todas as páginas"
+    );
+    println!(
+        "  sioux trocar-senha <arquivo>                              troca a senha sem recifrar o banco"
+    );
+    println!();
+    println!("Senha: pedida no terminal, ou SIOUX_SENHA / SIOUX_SENHA_NOVA em scripts.");
+}
+
+fn pedir_senha(variavel: &str, pergunta: &str) -> Result<String, String> {
+    if let Ok(s) = std::env::var(variavel) {
+        return Ok(s);
+    }
+    rpassword::prompt_password(pergunta).map_err(|e| format!("não foi possível ler a senha: {e}"))
+}
+
+fn senha_nova(variavel: &str) -> Result<String, String> {
+    if let Ok(s) = std::env::var(variavel) {
+        return validar_senha(s);
+    }
+    let s = pedir_senha(variavel, "Nova senha: ")?;
+    let conferir = pedir_senha(variavel, "Repita a senha: ")?;
+    if s != conferir {
+        return Err("as senhas não conferem".into());
+    }
+    validar_senha(s)
+}
+
+fn validar_senha(s: String) -> Result<String, String> {
+    if s.chars().count() < 8 {
+        return Err("a senha precisa de pelo menos 8 caracteres".into());
+    }
+    Ok(s)
+}
+
+/// Abre em claro; se o arquivo for cifrado, pede a senha.
+fn abrir(arquivo: &str) -> Result<Pag, String> {
+    let vfs = VfsReal::novo();
+    match Pag::abrir(&vfs, Path::new(arquivo), CACHE) {
+        Err(ErroArmazenamento::SenhaNecessaria) => {
+            let senha = pedir_senha("SIOUX_SENHA", "Senha: ")?;
+            Pag::abrir_com(&vfs, Path::new(arquivo), CACHE, Some(senha.as_bytes()))
+                .map_err(|e| e.to_string())
+        }
+        r => r.map_err(|e| e.to_string()),
+    }
 }
 
 fn criar(arquivo: &str, resto: &[&str]) -> Result<(), String> {
-    let tamanho = match resto {
-        [] => TamanhoPagina::default(),
-        ["--pagina", kb] => kb
-            .parse::<u32>()
-            .ok()
-            .and_then(|kb| TamanhoPagina::de_bytes(kb * 1024))
-            .ok_or_else(|| format!("tamanho de página inválido: {kb} (use 4, 8, 16 ou 32)"))?,
-        _ => return Err("opção desconhecida (use --pagina 4|8|16|32)".into()),
+    let mut tamanho = TamanhoPagina::default();
+    let mut cifrar = true;
+    let mut i = 0;
+    while i < resto.len() {
+        match resto[i] {
+            "--pagina" => {
+                let kb = resto
+                    .get(i + 1)
+                    .ok_or("falta o tamanho depois de --pagina")?;
+                tamanho = kb
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|kb| TamanhoPagina::de_bytes(kb * 1024))
+                    .ok_or_else(|| {
+                        format!("tamanho de página inválido: {kb} (use 4, 8, 16 ou 32)")
+                    })?;
+                i += 2;
+            }
+            "--sem-cifra" => {
+                cifrar = false;
+                i += 1;
+            }
+            outra => return Err(format!("opção desconhecida: {outra}")),
+        }
+    }
+    if Path::new(arquivo).exists() {
+        return Err(format!("o arquivo já existe: {arquivo}"));
+    }
+    let senha = if cifrar {
+        Some(senha_nova("SIOUX_SENHA")?)
+    } else {
+        None
     };
-    let p =
-        Pag::criar(&VfsReal::novo(), Path::new(arquivo), tamanho, 16).map_err(|e| e.to_string())?;
+    let senha = senha.as_deref().map(|s| SenhaNova {
+        senha: s.as_bytes(),
+        parametros: ParametrosSenha::default(),
+    });
+    let p = Pag::criar_com(&VfsReal::novo(), Path::new(arquivo), tamanho, CACHE, senha)
+        .map_err(|e| e.to_string())?;
+    let modo = if p.cifrado() {
+        "cifrado"
+    } else {
+        "EM CLARO (sem cifra)"
+    };
     println!(
-        "criado {arquivo} (páginas de {} KiB)",
+        "criado {arquivo}: páginas de {} KiB, {modo}",
         p.tamanho_pagina().bytes() / 1024
     );
     Ok(())
 }
 
 fn info(arquivo: &str) -> Result<(), String> {
-    let p = Pag::abrir(&VfsReal::novo(), Path::new(arquivo), 16).map_err(|e| e.to_string())?;
+    let p = abrir(arquivo)?;
     let c = p.cabecalho();
     let tam = c.tamanho_pagina.bytes() as u64;
     println!("arquivo          {arquivo}");
     println!("formato          {}", siouxdb::VERSAO_FORMATO);
-    println!("página           {} KiB", tam / 1024);
+    match &c.protecao {
+        Some(pr) => println!(
+            "cifra            XChaCha20-Poly1305 · senha Argon2id ({} MiB, {} iterações, {} linha(s))",
+            pr.parametros.memoria_kib / 1024,
+            pr.parametros.iteracoes,
+            pr.parametros.paralelismo
+        ),
+        None => println!("cifra            nenhuma (arquivo em claro)"),
+    }
+    println!(
+        "página           {} KiB ({} bytes úteis)",
+        tam / 1024,
+        p.tamanho_util()
+    );
     println!("páginas          {}", c.total_paginas);
     println!("tamanho          {} bytes", c.total_paginas * tam);
     println!("geração          {}", c.geracao);
@@ -93,10 +197,10 @@ fn info(arquivo: &str) -> Result<(), String> {
 }
 
 fn verificar(arquivo: &str) -> Result<(), String> {
-    let p = Pag::abrir(&VfsReal::novo(), Path::new(arquivo), 16).map_err(|e| e.to_string())?;
+    let p = abrir(arquivo)?;
     let total = p.cabecalho().total_paginas;
     let mut ruins = 0u64;
-    for n in siouxdb::armazenamento::PAGINAS_RESERVADAS..total {
+    for n in PAGINAS_RESERVADAS..total {
         match p.ler(n) {
             Ok(_) => {}
             Err(
@@ -115,4 +219,19 @@ fn verificar(arquivo: &str) -> Result<(), String> {
     } else {
         Err(format!("{ruins} página(s) com problema"))
     }
+}
+
+fn trocar_senha(arquivo: &str) -> Result<(), String> {
+    let p = abrir(arquivo)?;
+    if !p.cifrado() {
+        return Err("o arquivo não é cifrado".into());
+    }
+    let nova = senha_nova("SIOUX_SENHA_NOVA")?;
+    p.trocar_senha(SenhaNova {
+        senha: nova.as_bytes(),
+        parametros: ParametrosSenha::default(),
+    })
+    .map_err(|e| e.to_string())?;
+    println!("senha trocada");
+    Ok(())
 }

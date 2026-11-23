@@ -11,13 +11,18 @@ use tauri::State;
 type Estado<'a> = State<'a, Arc<Studio>>;
 
 #[tauri::command]
-fn abrir(estado: Estado<'_>, caminho: String) -> Result<Resumo, String> {
-    estado.abrir(&caminho)
+fn abrir(estado: Estado<'_>, caminho: String, senha: Option<String>) -> Result<Resumo, String> {
+    estado.abrir(&caminho, senha.as_deref())
 }
 
 #[tauri::command]
-fn criar(estado: Estado<'_>, caminho: String, kb: u32) -> Result<Resumo, String> {
-    estado.criar(&caminho, kb)
+fn criar(
+    estado: Estado<'_>,
+    caminho: String,
+    kb: u32,
+    senha: Option<String>,
+) -> Result<Resumo, String> {
+    estado.criar(&caminho, kb, senha.as_deref())
 }
 
 #[tauri::command]

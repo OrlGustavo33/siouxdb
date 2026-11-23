@@ -1,0 +1,18 @@
+[package]
+name = "siouxdb-cripto"
+description = "Criptografia do SiouxDB: cifra de página (XChaCha20-Poly1305), chave derivada da senha (Argon2id) e envelope de chaves. Só bibliotecas auditadas."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+zeroize = "1"
+getrandom = "0.3"
+
+[lints]
+workspace = true

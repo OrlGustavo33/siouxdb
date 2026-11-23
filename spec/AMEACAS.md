@@ -15,6 +15,12 @@
 | Processo malicioso na mesma máquina, sem a chave | ler a memória ou o disco | chaves zeradas após uso, `mlock` opcional; fora do escopo se ele tiver privilégio de root/admin |
 | Dono do servidor que quer adulterar o passado | reescrever e reassinar | âncora diária externa (RFC 3161 / OpenTimestamps) e testemunhas |
 
+## Estado da implementação (22/11/2026)
+- ✅ Arquivo cifrado por página (XChaCha20-Poly1305), AAD com número da página e versão; senha por Argon2id; chave do arquivo em envelope; cabeçalho autenticado; chaves apagadas da memória (`zeroize`); mensagens de erro não dizem se foi a senha ou adulteração.
+- ⏳ Reversão de página para versão antiga da mesma posição: detectada só com a cadeia de hashes (M6).
+- ⏳ Trava de arquivo (dois processos abrindo o mesmo banco): M3.
+- ⏳ `mlock` das chaves, chave por coluna e por titular: M7.
+
 ## Fora do escopo
 - Atacante com a chave do usuário (ele **é** o usuário).
 - Atacante com controle total da máquina durante o uso (pode ler a memória do processo).

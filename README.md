@@ -76,11 +76,12 @@ Só o motor é obrigatório; o resto é opcional. Embutido (como o SQLite) ou se
 | v0.4 | Análise e desempenho: colunas, índices adaptativo e aprendido, perfis e ajuste automático |
 | v0.5+ | Cluster com Raft e IA local |
 
-**Feito até agora (M0 e M1):**
+**Feito até agora (M0, M1 e M2):**
 - workspace e CI em Linux, macOS e Windows;
 - `siouxdb-vfs`: disco real e disco simulado. O simulado reproduz queda de energia com gravações perdidas ou cortadas no meio de um setor, de forma determinística por semente;
 - `siouxdb-armazenamento`: páginas com verificação (CRC32C + número da página), cabeçalho em duas cópias alternadas, cache SIEVE e paginador. Testado com centenas de quedas simuladas: nunca aceita página misturada;
-- comando `sioux criar | info | verificar`.
+- `siouxdb-cripto`: arquivo **cifrado por padrão** — cada página com XChaCha20-Poly1305 (página trocada de lugar ou alterada não decifra), senha por Argon2id, chave do arquivo em envelope (trocar a senha não recifra nada) e cabeçalho autenticado. Os testes de queda de energia rodam também com cifra;
+- comando `sioux criar | info | verificar | trocar-senha`.
 - `siouxdb-metricas`: histograma sem trava, séries de 60 s e alertas configuráveis;
 - **SiouxDB Studio** (`studio/`, Tauri): painel de monitoramento em tempo real sobre um arquivo ou uma demonstração com carga gerada.
 
@@ -90,7 +91,7 @@ Só o motor é obrigatório; o resto é opcional. Embutido (como o SQLite) ou se
 git clone https://github.com/OrlGustavo33/siouxdb
 cd siouxdb
 cargo test
-cargo run -p siouxdb-cli -- criar teste.sdb
+cargo run -p siouxdb-cli -- criar teste.sdb     # pede uma senha (cifrado por padrão)
 cargo run -p siouxdb-cli -- info teste.sdb
 ```
 
@@ -126,6 +127,6 @@ It can also run in **server mode**, like PostgreSQL: same file, speaking the Pos
 
 The planned ecosystem adds a desktop studio (Tauri) with a simple real-time monitoring dashboard, hot/incremental backups, optional Raft replication, optional local AI, and migration, sync and bridge tools for moving off legacy databases.
 
-**Status: pre-alpha.** The disk layer (with a deterministic crash simulator) and checksummed page storage (dual header, SIEVE cache) exist today. Do not store real data yet.
+**Status: pre-alpha.** The disk layer (with a deterministic crash simulator) and checksummed page storage (dual header, SIEVE cache) and per-page encryption (XChaCha20-Poly1305, Argon2id password, envelope key, authenticated header) exist today. Do not store real data yet.
 
 The project was conceived by **Sioux** (SiouxSys) and is being built with **Claude** (Anthropic) through **Claude Code in VS Code**, with human review. It is dual-licensed under MIT or Apache-2.0.

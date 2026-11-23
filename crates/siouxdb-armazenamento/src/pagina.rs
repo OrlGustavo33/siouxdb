@@ -9,7 +9,7 @@
 //! 24..    conteúdo
 //! ```
 
-use crate::{ErroArmazenamento, NumeroPagina, Resultado, TamanhoPagina, crc32c};
+use crate::{ErroArmazenamento, NumeroPagina, Resultado, crc32c};
 
 /// Bytes do cabeçalho de cada página.
 pub const CABECALHO_PAGINA: usize = 24;
@@ -56,9 +56,10 @@ pub struct Pagina {
 }
 
 impl Pagina {
-    /// Página zerada do tipo dado.
-    pub fn nova(tamanho: TamanhoPagina, tipo: TipoPagina) -> Pagina {
-        let mut dados = vec![0u8; tamanho.bytes()].into_boxed_slice();
+    /// Página zerada do tipo dado, com `tamanho` bytes (o tamanho útil: num arquivo
+    /// cifrado é o tamanho da página menos o que a cifra ocupa).
+    pub fn nova(tamanho: usize, tipo: TipoPagina) -> Pagina {
+        let mut dados = vec![0u8; tamanho.max(CABECALHO_PAGINA)].into_boxed_slice();
         dados[4] = tipo as u8;
         Pagina { dados }
     }
@@ -138,7 +139,7 @@ mod testes {
 
     #[test]
     fn selar_e_reler() {
-        let mut p = Pagina::nova(TamanhoPagina::K4, TipoPagina::NoArvore);
+        let mut p = Pagina::nova(4096, TipoPagina::NoArvore);
         p.conteudo_mut()[..5].copy_from_slice(b"sioux");
         p.definir_lsn(99);
         let bytes: Box<[u8]> = p.selar(7).into();
@@ -153,7 +154,7 @@ mod testes {
 
     #[test]
     fn detecta_corrupcao_e_pagina_trocada() {
-        let mut p = Pagina::nova(TamanhoPagina::K4, TipoPagina::Catalogo);
+        let mut p = Pagina::nova(4096, TipoPagina::Catalogo);
         let mut bytes: Box<[u8]> = p.selar(3).into();
         assert!(matches!(
             Pagina::de_bytes(bytes.clone(), 4),

@@ -140,6 +140,7 @@ function desenhar(r) {
   }
   const filaNivel = nivelDe(foto.alertas, "fila_escritor");
   $("saude").innerHTML = `
+    <dt>Cifra</dt><dd class="${resumo.cifrado ? "ok" : "ruim"}">${resumo.cifrado ? "XChaCha20-Poly1305" : "nenhuma (em claro)"}</dd>
     <dt>Fila do escritor</dt><dd class="${filaNivel ? "ruim" : ""}">${num.format(i.fila_escritor)}</dd>
     <dt>Verificação</dt>${verif}
     <dt>Confirmações (geração)</dt><dd>${num.format(resumo.geracao)}</dd>
@@ -194,6 +195,9 @@ function abrirBarra(modo) {
   modoArquivo = modo;
   $("barra-arquivo").hidden = false;
   $("rotulo-kb").hidden = modo !== "novo";
+  $("rotulo-sem-cifra").hidden = modo !== "novo";
+  $("senha").placeholder = modo === "novo" ? "mínimo 8 caracteres" : "se o arquivo for cifrado";
+  $("senha").value = "";
   $("confirmar-arquivo").textContent = modo === "novo" ? "Criar" : "Abrir";
   $("caminho").focus();
 }
@@ -206,7 +210,7 @@ async function executar(acao) {
       case "cancelar-arquivo": $("barra-arquivo").hidden = true; return;
       case "demonstracao":
         await api("demonstracao");
-        avisar("Demonstração iniciada: banco temporário com carga gerada pelo Studio. Ele é apagado ao fechar.", true);
+        avisar("Demonstração iniciada: banco temporário cifrado, com carga gerada pelo Studio. Ele é apagado ao fechar.", true);
         break;
       case "fechar":
         await api("fechar");
@@ -233,9 +237,16 @@ document.addEventListener("click", (ev) => {
 $("barra-arquivo").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const caminho = $("caminho").value;
+  const senhaDigitada = $("senha").value;
   try {
-    if (modoArquivo === "novo") await api("criar", { caminho, kb: Number($("kb").value) });
-    else await api("abrir", { caminho });
+    if (modoArquivo === "novo") {
+      const semCifra = $("sem-cifra").checked;
+      if (!semCifra && !senhaDigitada) throw "Informe uma senha (o banco é cifrado) ou marque “Sem cifra”.";
+      await api("criar", { caminho, kb: Number($("kb").value), senha: semCifra ? null : senhaDigitada });
+    } else {
+      await api("abrir", { caminho, senha: senhaDigitada || null });
+    }
+    $("senha").value = "";
     $("barra-arquivo").hidden = true;
     await atualizar();
   } catch (e) {
@@ -301,7 +312,7 @@ function criarPrevia() {
   setInterval(() => { if (sessao) foto = passo(); }, 1000);
   return async (cmd, args) => {
     switch (cmd) {
-      case "demonstracao": sessao = { origem: "demonstracao", caminho: "/tmp/siouxdb-studio-demo.sdb", pagina_kb: 4 }; foto = passo(); return {};
+      case "demonstracao": sessao = { origem: "demonstracao", caminho: "/tmp/siouxdb-studio-demo.sdb", pagina_kb: 4, cifrado: true }; foto = passo(); return {};
       case "abrir": case "criar": throw "Prévia no navegador: abrir e criar arquivos só no aplicativo.";
       case "fechar": sessao = null; return null;
       case "verificar": verificacao = { quando: Date.now() / 1000, paginas, problemas: [], duracao_ms: 12 }; return verificacao;

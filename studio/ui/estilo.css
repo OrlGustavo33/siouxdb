@@ -89,10 +89,12 @@ button.icone svg { width: 18px; height: 18px; fill: none; stroke: currentColor; 
 }
 .barra-arquivo label { display: flex; align-items: center; gap: 8px; color: var(--texto-suave); }
 .barra-arquivo label:first-child { flex: 1; min-width: 260px; }
-.barra-arquivo input, .barra-arquivo select, dialog input {
+.barra-arquivo input:not([type=checkbox]), .barra-arquivo select, dialog input {
   padding: 6px 10px; border: 1px solid var(--borda); border-radius: 7px; background: var(--fundo);
 }
-.barra-arquivo input { flex: 1; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+.barra-arquivo input#senha { flex: none; width: 200px; font-family: inherit; }
+.barra-arquivo .marcar { gap: 6px; }
+.barra-arquivo input#caminho { flex: 1; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
 
 .mensagem { margin: 12px 20px 0; padding: 8px 12px; border-radius: 8px; background: var(--critico-fundo); color: var(--critico); }
 .mensagem.ok { background: var(--superficie); color: var(--ok); border: 1px solid var(--borda); }

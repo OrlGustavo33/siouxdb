@@ -2,7 +2,9 @@
 //! verificação e a carga de demonstração. Testável com `cargo test`.
 
 use serde::Serialize;
-use siouxdb::armazenamento::{PAGINAS_RESERVADAS, Paginador, TamanhoPagina, TipoPagina};
+use siouxdb::armazenamento::{
+    PAGINAS_RESERVADAS, Paginador, ParametrosSenha, SenhaNova, TamanhoPagina, TipoPagina,
+};
 use siouxdb::metricas::{Coletor, FotoPainel, LimitesAlerta};
 use siouxdb::vfs::{Vfs, VfsReal};
 use std::path::{Path, PathBuf};
@@ -35,6 +37,8 @@ pub struct Resumo {
     pub caminho: String,
     /// Tamanho de página em KiB.
     pub pagina_kb: u64,
+    /// O arquivo é cifrado?
+    pub cifrado: bool,
     /// Total de páginas.
     pub paginas: u64,
     /// Geração do cabeçalho.
@@ -156,19 +160,30 @@ impl Studio {
     }
 
     /// Abre um arquivo existente.
-    pub fn abrir(&self, caminho: &str) -> Result<Resumo, String> {
+    pub fn abrir(&self, caminho: &str, senha: Option<&str>) -> Result<Resumo, String> {
         let caminho = caminho_valido(caminho)?;
         // O anterior só é fechado se este abrir: um erro não derruba o que estava aberto.
-        let p = Pag::abrir(&VfsReal::novo(), &caminho, CACHE_PAGINAS).map_err(|e| e.to_string())?;
+        let senha = senha.filter(|s| !s.is_empty()).map(str::as_bytes);
+        let p = Pag::abrir_com(&VfsReal::novo(), &caminho, CACHE_PAGINAS, senha)
+            .map_err(|e| e.to_string())?;
         Ok(self.instalar(Origem::Arquivo, caminho, p, None))
     }
 
-    /// Cria um arquivo novo (recusa se já existir).
-    pub fn criar(&self, caminho: &str, kb: u32) -> Result<Resumo, String> {
+    /// Cria um arquivo novo (recusa se já existir). Com `senha`, cifrado; `None` = em claro.
+    pub fn criar(&self, caminho: &str, kb: u32, senha: Option<&str>) -> Result<Resumo, String> {
         let caminho = caminho_valido(caminho)?;
         let tamanho = TamanhoPagina::de_bytes(kb.saturating_mul(1024))
             .ok_or_else(|| format!("tamanho de página inválido: {kb} KiB (use 4, 8, 16 ou 32)"))?;
-        let p = Pag::criar(&VfsReal::novo(), &caminho, tamanho, CACHE_PAGINAS)
+        if let Some(s) = senha
+            && s.chars().count() < 8
+        {
+            return Err("a senha precisa de pelo menos 8 caracteres".into());
+        }
+        let senha = senha.map(|s| SenhaNova {
+            senha: s.as_bytes(),
+            parametros: ParametrosSenha::default(),
+        });
+        let p = Pag::criar_com(&VfsReal::novo(), &caminho, tamanho, CACHE_PAGINAS, senha)
             .map_err(|e| e.to_string())?;
         Ok(self.instalar(Origem::Arquivo, caminho, p, None))
     }
@@ -180,8 +195,21 @@ impl Studio {
             std::env::temp_dir().join(format!("siouxdb-studio-demo-{}.sdb", std::process::id()));
         // O nome é só nosso (leva o PID): sobra de uma execução anterior pode ser apagada.
         let _ = std::fs::remove_file(&caminho);
-        let p = Pag::criar(&VfsReal::novo(), &caminho, TamanhoPagina::K4, 256)
-            .map_err(|e| e.to_string())?;
+        // Cifrado como um banco de verdade (mede o custo real da cifra), com senha sorteada
+        // e Argon2id leve: o arquivo é temporário e apagado ao fechar.
+        let senha = format!("demo-{}-{:?}", std::process::id(), Instant::now());
+        let senha = SenhaNova {
+            senha: senha.as_bytes(),
+            parametros: ParametrosSenha::para_testes(),
+        };
+        let p = Pag::criar_com(
+            &VfsReal::novo(),
+            &caminho,
+            TamanhoPagina::K4,
+            256,
+            Some(senha),
+        )
+        .map_err(|e| e.to_string())?;
         let p = Arc::new(p);
         let parar = Arc::new(AtomicBool::new(false));
         let tarefa = {
@@ -300,6 +328,7 @@ fn resumo(s: &Sessao) -> Resumo {
         origem: s.origem.clone(),
         caminho: s.caminho.display().to_string(),
         pagina_kb: c.tamanho_pagina.bytes() as u64 / 1024,
+        cifrado: s.paginador.cifrado(),
         paginas: c.total_paginas,
         geracao: c.geracao,
         ultimo_lsn: c.ultimo_lsn,
@@ -406,11 +435,13 @@ mod testes {
         let arq = pasta().join("criar.sdb");
         let _ = std::fs::remove_file(&arq);
         let caminho = arq.display().to_string();
-        assert!(studio.criar(&caminho, 3).is_err());
-        let r = studio.criar(&caminho, 16).unwrap();
+        assert!(studio.criar(&caminho, 3, None).is_err());
+        assert!(studio.criar(&caminho, 16, Some("curta")).is_err());
+        let r = studio.criar(&caminho, 16, Some("senha-de-teste")).unwrap();
+        assert!(r.cifrado);
         assert_eq!((r.pagina_kb, r.paginas), (16, 2));
         assert!(
-            studio.criar(&caminho, 16).is_err(),
+            studio.criar(&caminho, 16, None).is_err(),
             "não pode criar por cima"
         );
         studio.coletar();
@@ -426,8 +457,17 @@ mod testes {
 
         studio.fechar();
         assert!(studio.painel().is_none());
-        assert_eq!(studio.abrir(&caminho).unwrap().paginas, 2);
-        assert!(studio.abrir("  ").is_err());
+        let sem = studio.abrir(&caminho, None).unwrap_err();
+        assert!(sem.contains("senha"), "{sem}");
+        assert!(studio.abrir(&caminho, Some("errada-123")).is_err());
+        assert_eq!(
+            studio
+                .abrir(&caminho, Some("senha-de-teste"))
+                .unwrap()
+                .paginas,
+            2
+        );
+        assert!(studio.abrir("  ", None).is_err());
         studio.fechar();
         std::fs::remove_file(&arq).unwrap();
     }
@@ -437,6 +477,7 @@ mod testes {
         let studio = Studio::novo();
         let r = studio.demonstracao().unwrap();
         assert_eq!(r.origem, Origem::Demonstracao);
+        assert!(r.cifrado);
         std::thread::sleep(Duration::from_millis(600));
         studio.coletar();
         let foto = studio.painel().unwrap().foto;
