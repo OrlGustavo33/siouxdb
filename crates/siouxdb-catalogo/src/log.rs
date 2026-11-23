@@ -24,6 +24,11 @@ use siouxdb_transacoes::{Paginas, PaginasMut};
 
 const CAB_PAGINA: usize = 16;
 const CAB_REGISTRO: usize = 32;
+const MARCA_TRANSBORDO: u8 = 2;
+const CAB_TRANSBORDO: usize = 12;
+
+/// Maior linha aceita (16 MiB).
+pub const MAXIMO_VALOR: usize = 16 << 20;
 const RUIM: ErroCatalogo = ErroCatalogo::Corrompido("registro do log com forma inesperada");
 
 /// Endereço de uma versão no log: página e posição dentro dela. Zero = nenhuma.
@@ -77,8 +82,11 @@ pub struct Versao<'a> {
     pub instante: u64,
     /// Chave codificada.
     pub chave: &'a [u8],
-    /// Linha codificada (vazia numa remoção).
+    /// Linha codificada (vazia numa remoção). Se [`Versao::transbordo`], é só o endereço:
+    /// use [`dados_completos`].
     pub dados: &'a [u8],
+    /// Os dados estão em páginas de transbordo?
+    pub transbordo: bool,
 }
 
 /// Maior registro (chave + linha codificadas) que cabe numa página.
@@ -95,24 +103,45 @@ pub struct Pontas {
     pub cauda: NumeroPagina,
 }
 
-/// Anexa uma versão e devolve o endereço dela.
+/// Anexa uma versão (com o LSN e o instante dados) e devolve o endereço dela.
 #[allow(clippy::too_many_arguments)]
 pub fn anexar<P: PaginasMut + ?Sized>(
     tx: &mut P,
     pontas: &mut Pontas,
     removida: bool,
     anterior: Ponteiro,
+    lsn: u64,
     instante: u64,
     chave: &[u8],
     dados: &[u8],
 ) -> Resultado<Ponteiro> {
     let conteudo = tx.tamanho_conteudo();
-    if chave.len() + dados.len() > maximo_registro(conteudo) || chave.len() > u16::MAX as usize {
+    if chave.len() > maximo_registro(conteudo) / 4 {
         return Err(ErroCatalogo::LinhaGrandeDemais {
-            tamanho: chave.len() + dados.len(),
-            maximo: maximo_registro(conteudo),
+            tamanho: chave.len(),
+            maximo: maximo_registro(conteudo) / 4,
         });
     }
+    if dados.len() > MAXIMO_VALOR {
+        return Err(ErroCatalogo::LinhaGrandeDemais {
+            tamanho: dados.len(),
+            maximo: MAXIMO_VALOR,
+        });
+    }
+    // Dados grandes vão para páginas de transbordo; o registro guarda só o endereço. Assim
+    // o log continua denso (muitas versões por página) e o tamanho da linha não tem o limite
+    // da página.
+    let endereco;
+    let (dados, marcas) = if chave.len() + dados.len() > maximo_registro(conteudo) / 2 {
+        let primeira = gravar_transbordo(tx, dados)?;
+        let mut e = [0u8; 16];
+        e[..8].copy_from_slice(&(dados.len() as u64).to_le_bytes());
+        e[8..].copy_from_slice(&primeira.to_le_bytes());
+        endereco = e;
+        (&endereco[..], u8::from(removida) | MARCA_TRANSBORDO)
+    } else {
+        (dados, u8::from(removida))
+    };
     let tam = CAB_REGISTRO + chave.len() + dados.len();
     let mut usado = 0;
     if pontas.cauda != 0 {
@@ -132,12 +161,11 @@ pub fn anexar<P: PaginasMut + ?Sized>(
         pontas.cauda = nova;
         usado = 0;
     }
-    let lsn = tx.lsn();
     let b = tx.pagina_mut(pontas.cauda)?.conteudo_mut();
     let pos = CAB_PAGINA + usado;
     let r = &mut b[pos..pos + tam];
     r[0..2].copy_from_slice(&(tam as u16).to_le_bytes());
-    r[2] = u8::from(removida);
+    r[2] = marcas;
     r[3] = 0;
     r[4..6].copy_from_slice(&(chave.len() as u16).to_le_bytes());
     r[6..8].fill(0);
@@ -172,6 +200,7 @@ pub fn ler_com<P: Paginas + ?Sized, T>(
     let r = b.get(pos..pos + tam).ok_or(RUIM)?;
     Ok(f(Versao {
         removida: r[2] & 1 == 1,
+        transbordo: r[2] & MARCA_TRANSBORDO != 0,
         anterior: Ponteiro(u64::from_le_bytes(r[8..16].try_into().expect("8"))),
         lsn: u64::from_le_bytes(r[16..24].try_into().expect("8")),
         instante: u64::from_le_bytes(r[24..32].try_into().expect("8")),
@@ -189,11 +218,120 @@ pub fn liberar<P: PaginasMut + ?Sized>(tx: &mut P, primeira: NumeroPagina) -> Re
         if p.tipo() != TipoPagina::LogQuente || total > limite {
             return Err(RUIM);
         }
-        let proxima = u64::from_le_bytes(p.conteudo()[0..8].try_into().expect("8"));
+        let b = p.conteudo();
+        let proxima = u64::from_le_bytes(b[0..8].try_into().expect("8"));
+        // Antes de soltar a página, solta os transbordos dos registros dela.
+        let usado = u16::from_le_bytes([b[8], b[9]]) as usize;
+        let mut transbordos = Vec::new();
+        let mut pos = CAB_PAGINA;
+        while pos < CAB_PAGINA + usado {
+            let r = b.get(pos..pos + CAB_REGISTRO).ok_or(RUIM)?;
+            let tam = u16::from_le_bytes([r[0], r[1]]) as usize;
+            let k = u16::from_le_bytes([r[4], r[5]]) as usize;
+            if tam < CAB_REGISTRO + k {
+                return Err(RUIM);
+            }
+            if r[2] & MARCA_TRANSBORDO != 0 {
+                transbordos.push(
+                    b.get(pos + CAB_REGISTRO + k..pos + tam)
+                        .ok_or(RUIM)?
+                        .to_vec(),
+                );
+            }
+            pos += tam;
+        }
         drop(p);
+        for t in transbordos {
+            liberar_transbordo(tx, true, &t)?;
+        }
         tx.liberar(atual)?;
         total += 1;
         atual = proxima;
     }
     Ok(total)
+}
+
+/// Grava `dados` numa corrente de páginas de transbordo e devolve a primeira.
+/// Página: próxima (u64) · bytes nesta página (u32) · bytes.
+fn gravar_transbordo<P: PaginasMut + ?Sized>(tx: &mut P, dados: &[u8]) -> Resultado<NumeroPagina> {
+    let cabe = tx.tamanho_conteudo() - CAB_TRANSBORDO;
+    let pedacos: Vec<&[u8]> = dados.chunks(cabe).collect();
+    let mut proxima = 0u64;
+    // De trás para a frente: cada página já nasce sabendo a próxima.
+    for pedaco in pedacos.iter().rev() {
+        let n = tx.alocar(TipoPagina::Transbordo)?;
+        let b = tx.pagina_mut(n)?.conteudo_mut();
+        b[0..8].copy_from_slice(&proxima.to_le_bytes());
+        b[8..12].copy_from_slice(&(pedaco.len() as u32).to_le_bytes());
+        b[CAB_TRANSBORDO..CAB_TRANSBORDO + pedaco.len()].copy_from_slice(pedaco);
+        proxima = n;
+    }
+    Ok(proxima)
+}
+
+fn endereco_transbordo(dados: &[u8]) -> Resultado<(usize, NumeroPagina)> {
+    if dados.len() != 16 {
+        return Err(RUIM);
+    }
+    let total = u64::from_le_bytes(dados[..8].try_into().expect("8")) as usize;
+    Ok((total, u64::from_le_bytes(dados[8..].try_into().expect("8"))))
+}
+
+/// Dados completos de uma versão (lê o transbordo se preciso).
+pub fn dados_completos<'v, P: Paginas + ?Sized>(
+    p: &P,
+    v: &Versao<'v>,
+) -> Resultado<std::borrow::Cow<'v, [u8]>> {
+    if !v.transbordo {
+        return Ok(std::borrow::Cow::Borrowed(v.dados));
+    }
+    let (total, mut atual) = endereco_transbordo(v.dados)?;
+    if total > MAXIMO_VALOR {
+        return Err(RUIM);
+    }
+    let mut saida = Vec::with_capacity(total);
+    while saida.len() < total {
+        if atual == 0 {
+            return Err(RUIM);
+        }
+        let pagina = p.pagina(atual)?;
+        if pagina.tipo() != TipoPagina::Transbordo {
+            return Err(RUIM);
+        }
+        let b = pagina.conteudo();
+        let n = u32::from_le_bytes(b[8..12].try_into().expect("4")) as usize;
+        let pedaco = b.get(CAB_TRANSBORDO..CAB_TRANSBORDO + n).ok_or(RUIM)?;
+        if n == 0 || saida.len() + n > total {
+            return Err(RUIM);
+        }
+        saida.extend_from_slice(pedaco);
+        atual = u64::from_le_bytes(b[0..8].try_into().expect("8"));
+    }
+    Ok(std::borrow::Cow::Owned(saida))
+}
+
+/// Libera a corrente de transbordo de uma versão (se tiver).
+pub fn liberar_transbordo<P: PaginasMut + ?Sized>(
+    tx: &mut P,
+    transbordo: bool,
+    dados: &[u8],
+) -> Resultado<()> {
+    if !transbordo {
+        return Ok(());
+    }
+    let (_, mut atual) = endereco_transbordo(dados)?;
+    let limite = tx.meta().total_paginas;
+    let mut passos = 0;
+    while atual != 0 {
+        let p = tx.pagina(atual)?;
+        if p.tipo() != TipoPagina::Transbordo || passos > limite {
+            return Err(RUIM);
+        }
+        let proxima = u64::from_le_bytes(p.conteudo()[0..8].try_into().expect("8"));
+        drop(p);
+        tx.liberar(atual)?;
+        atual = proxima;
+        passos += 1;
+    }
+    Ok(())
 }

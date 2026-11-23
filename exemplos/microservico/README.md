@@ -26,6 +26,7 @@ SIOUX_ENDERECO=127.0.0.1:7878 \
 | `SIOUX_TOKEN` | obrigatório (≥ 16 caracteres): `Authorization: Bearer <token>` em toda rota, menos `/saude` |
 | `SIOUX_SENHA` | senha do banco; sem ela o arquivo fica **em claro** (aparece um aviso) |
 | `SIOUX_ARQUIVO` | arquivo do banco (padrão `dados.sdb`; criado se não existir; o WAL fica ao lado, `-wal`) |
+| `SIOUX_BACKUP_DIR` | pasta das cópias feitas por `POST /backup` (sem ela, a rota recusa) |
 | `SIOUX_ENDERECO` | padrão `127.0.0.1:7878` — exponha por um proxy com HTTPS (nginx/Caddy), não direto |
 
 Só **um processo** pode abrir o arquivo (o segundo recebe "em uso"). Ao receber SIGTERM/Ctrl+C ele termina as requisições, faz o checkpoint e sai.
@@ -48,11 +49,17 @@ curl -H "$T" $U/tabelas/clientes/linhas/1                                 # pela
 curl -H "$T" "$U/tabelas/clientes/linhas/1?lsn=2"                         # como estava na confirmação 2
 curl -H "$T" $U/tabelas/clientes/linhas/1/historico                       # todas as versões
 curl -H "$T" -X DELETE $U/tabelas/clientes/linhas/1
+curl -H "$T" "$U/tabelas/clientes/linhas?onde=nome:ANA"                  # filtro por coluna (igual)
+curl -H "$T" -X POST $U/tabelas/clientes/compactar                        # limpa o histórico (fica a versão atual)
+curl -H "$T" -X POST "$U/tabelas/clientes/compactar?manter_lsn=500"       # mantém o histórico a partir do LSN 500
+curl -H "$T" -X POST $U/backup                                            # cópia a quente em SIOUX_BACKUP_DIR
 curl -H "$T" $U/tabelas                                                   # tabelas + contagem
 curl -H "$T" -X DELETE $U/tabelas/clientes
 ```
 
-Tipos: `inteiro`, `real`, `texto`, `bytes` (em base16), `booleano`. Chave composta na URL: valores separados por `|` (`/linhas/SP|SANTOS`). Toda escrita responde com o `lsn` da confirmação.
+Tipos: `inteiro`, `real`, `texto`, `bytes` (em base16), `booleano`. Linha de até 16 MiB (o corpo da requisição é limitado a 1 MiB).
+
+**Cuidados:** toda alteração guarda uma versão nova — rode `compactar` de vez em quando, senão o arquivo só cresce. Faça `POST /backup` periódico (um cron com curl serve) e guarde as cópias em outro disco; a cópia abre com a mesma senha (`sioux verificar copia.sdb`). Chave composta na URL: valores separados por `|` (`/linhas/SP|SANTOS`). Toda escrita responde com o `lsn` da confirmação.
 
 ## Serviço systemd (exemplo)
 

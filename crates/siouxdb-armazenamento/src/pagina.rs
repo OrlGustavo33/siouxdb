@@ -34,6 +34,8 @@ pub enum TipoPagina {
     Razao = 6,
     /// Cabeçalho de uma tabela (raiz do índice, pontas do log, contagens).
     CabecalhoTabela = 7,
+    /// Pedaço de um valor grande que não coube no registro (corrente de páginas).
+    Transbordo = 8,
 }
 
 impl TipoPagina {
@@ -47,6 +49,7 @@ impl TipoPagina {
             5 => TipoPagina::Resumo,
             6 => TipoPagina::Razao,
             7 => TipoPagina::CabecalhoTabela,
+            8 => TipoPagina::Transbordo,
             _ => return None,
         })
     }

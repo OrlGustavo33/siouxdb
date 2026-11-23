@@ -427,6 +427,16 @@ impl<A: Arquivo> Paginador<A> {
         Pagina::de_bytes(dados, numero)
     }
 
+    /// Lê bytes crus do arquivo (como estão no disco), para cópia de segurança.
+    pub fn ler_bruto(&self, posicao: u64, destino: &mut [u8]) -> Resultado<usize> {
+        Ok(self.arquivo.ler_em(posicao, destino)?)
+    }
+
+    /// Tamanho do arquivo em bytes.
+    pub fn tamanho_arquivo(&self) -> Resultado<u64> {
+        Ok(self.arquivo.tamanho()?)
+    }
+
     /// Grava bytes já no formato do disco (vindos do WAL, no checkpoint), sem sincronizar,
     /// e tira a página do cache.
     pub fn gravar_do_disco(&self, numero: NumeroPagina, dados: &[u8]) -> Resultado<()> {

@@ -4,7 +4,8 @@
 //! - `SIOUX_TOKEN` (obrigatória): token exigido em `Authorization: Bearer <token>`;
 //! - `SIOUX_ARQUIVO` (padrão `dados.sdb`): arquivo do banco (criado se não existir);
 //! - `SIOUX_SENHA` (opcional): senha do banco — sem ela o arquivo fica **em claro**;
-//! - `SIOUX_ENDERECO` (padrão `127.0.0.1:7878`).
+//! - `SIOUX_ENDERECO` (padrão `127.0.0.1:7878`);
+//! - `SIOUX_BACKUP_DIR` (opcional): pasta das cópias de `POST /backup`.
 //!
 //! Rotas (JSON):
 //! - `GET  /saude`
@@ -14,6 +15,9 @@
 //! - `POST /tabelas/{t}/linhas` (insere; erro se a chave existe) · `PUT` (grava: cria ou substitui)
 //! - `GET  /tabelas/{t}/linhas/{chave}?lsn=` · `DELETE /tabelas/{t}/linhas/{chave}`
 //! - `GET  /tabelas/{t}/linhas/{chave}/historico`
+//! - `POST /tabelas/{t}/compactar?manter_lsn=` (sem `manter_lsn`: fica só a versão atual)
+//! - `POST /backup` (cópia a quente em `SIOUX_BACKUP_DIR`)
+//! - filtro na listagem: `?onde=coluna:valor` (compara igual; varre a faixa)
 //!
 //! Tipos: `inteiro`, `real`, `texto`, `bytes` (base16), `booleano`. Chave composta: use a
 //! rota de faixa ou junte os valores com `|` em `{chave}`.
@@ -35,6 +39,7 @@ use std::sync::Arc;
 struct App {
     banco: BancoArquivo,
     token: String,
+    pasta_backup: Option<std::path::PathBuf>,
 }
 
 type Estado = State<Arc<App>>;
@@ -313,11 +318,31 @@ async fn listar_linhas(
                 .transpose()
         };
         let (inicio, fim) = (limite_de("inicio")?, limite_de("fim")?);
+        let filtro = match q.get("onde") {
+            None => None,
+            Some(f) => {
+                let (col, val) = f
+                    .split_once(':')
+                    .ok_or_else(|| ruim("use onde=coluna:valor"))?;
+                let i = tab
+                    .def()
+                    .colunas
+                    .iter()
+                    .position(|c| c.nome == col.to_ascii_lowercase())
+                    .ok_or_else(|| ruim(format!("a tabela não tem a coluna \"{col}\"")))?;
+                let c = &tab.def().colunas[i];
+                Some((i, de_texto(val, c.tipo, &c.nome)?))
+            }
+        };
         let mut v = tab.varrer_em(&l, inicio.as_deref(), fim.as_deref(), lsn_de(&q)?)?;
         let mut linhas = Vec::new();
         while linhas.len() < limite {
             match v.proxima()? {
-                Some(linha) => linhas.push(linha_json(&tab, &linha)),
+                Some(linha) => {
+                    if filtro.as_ref().is_none_or(|(i, val)| &linha[*i] == val) {
+                        linhas.push(linha_json(&tab, &linha));
+                    }
+                }
                 None => break,
             }
         }
@@ -417,6 +442,48 @@ async fn historico(State(app): Estado, Path((t, k)): Path<(String, String)>) -> 
     .await
 }
 
+async fn compactar(
+    State(app): Estado,
+    Path(t): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> R<Json<J>> {
+    let manter = q.get("manter_lsn").map_or(Ok(u64::MAX), |s| {
+        s.parse().map_err(|_| ruim("manter_lsn inválido"))
+    })?;
+    no_banco(&app, move |b| {
+        let mut tx = b.escrever()?;
+        let tab = catalogo::tabela_obrigatoria(&tx, &t)?;
+        let r = tab.compactar(&mut tx, manter)?;
+        tx.confirmar()?;
+        b.checkpoint()?;
+        Ok(Json(json!({
+            "versoes_antes": r.versoes_antes,
+            "versoes_depois": r.versoes_depois,
+            "chaves_apagadas": r.chaves_apagadas,
+        })))
+    })
+    .await
+}
+
+async fn backup(State(app): Estado) -> R<Json<J>> {
+    let pasta = app
+        .pasta_backup
+        .clone()
+        .ok_or_else(|| ruim("defina SIOUX_BACKUP_DIR para usar o backup"))?;
+    no_banco(&app, move |b| {
+        let agora = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let destino = pasta.join(format!("dados-{agora}.sdb"));
+        let bytes = b.copiar_para(&siouxdb::vfs::VfsReal::novo(), &destino)?;
+        Ok(Json(
+            json!({ "arquivo": destino.display().to_string(), "bytes": bytes }),
+        ))
+    })
+    .await
+}
+
 /// Token em tempo constante (não vaza, pelo tempo de resposta, quantos caracteres batem).
 fn iguais(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -458,7 +525,15 @@ async fn main() {
         eprintln!("não abriu {arquivo}: {e}");
         std::process::exit(1);
     });
-    let app = Arc::new(App { banco, token });
+    let pasta_backup = std::env::var("SIOUX_BACKUP_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    let app = Arc::new(App {
+        banco,
+        token,
+        pasta_backup,
+    });
     let rotas = Router::new()
         .route("/tabelas", get(listar_tabelas).post(criar_tabela))
         .route("/tabelas/:t", axum::routing::delete(apagar_tabela))
@@ -471,6 +546,8 @@ async fn main() {
             get(obter_linha).delete(apagar_linha),
         )
         .route("/tabelas/:t/linhas/:k/historico", get(historico))
+        .route("/tabelas/:t/compactar", axum::routing::post(compactar))
+        .route("/backup", axum::routing::post(backup))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&app),
             exigir_token,

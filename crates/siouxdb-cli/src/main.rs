@@ -8,6 +8,8 @@
 //! sioux trocar-senha <arquivo>
 //! sioux checkpoint <arquivo>
 //! sioux tabelas <arquivo>
+//! sioux backup <arquivo> <destino>
+//! sioux compactar <arquivo> <tabela> [manter_desde_lsn]
 //! ```
 //!
 //! Arquivos novos são **cifrados por padrão**. A senha é pedida no terminal (sem eco) ou
@@ -40,6 +42,8 @@ fn main() -> ExitCode {
         ["trocar-senha", arquivo] => trocar_senha(arquivo),
         ["checkpoint", arquivo] => checkpoint(arquivo),
         ["tabelas", arquivo] => tabelas(arquivo),
+        ["backup", arquivo, destino] => backup(arquivo, destino),
+        ["compactar", arquivo, tabela, resto @ ..] => compactar(arquivo, tabela, resto),
         _ => {
             ajuda();
             return ExitCode::from(2);
@@ -300,5 +304,34 @@ fn tabelas(arquivo: &str) -> Result<(), String> {
             v[0], v[1], v[2], v[3], v[4]
         );
     }
+    Ok(())
+}
+
+fn backup(arquivo: &str, destino: &str) -> Result<(), String> {
+    let b = abrir(arquivo)?;
+    let bytes = b
+        .copiar_para(&VfsReal::novo(), Path::new(destino))
+        .map_err(|e| e.to_string())?;
+    println!("cópia em {destino} ({bytes} bytes, com o WAL ao lado); abre com a mesma senha");
+    Ok(())
+}
+
+fn compactar(arquivo: &str, tabela: &str, resto: &[&str]) -> Result<(), String> {
+    let manter = match resto {
+        [] => u64::MAX,
+        [l] => l.parse().map_err(|_| format!("LSN inválido: {l}"))?,
+        _ => return Err("uso: sioux compactar <arquivo> <tabela> [manter_desde_lsn]".into()),
+    };
+    let b = abrir(arquivo)?;
+    let mut tx = b.escrever().map_err(|e| e.to_string())?;
+    let t =
+        siouxdb::catalogo::catalogo::tabela_obrigatoria(&tx, tabela).map_err(|e| e.to_string())?;
+    let r = t.compactar(&mut tx, manter).map_err(|e| e.to_string())?;
+    tx.confirmar().map_err(|e| e.to_string())?;
+    b.checkpoint().map_err(|e| e.to_string())?;
+    println!(
+        "versões: {} → {} ({} chave(s) removida(s) saíram de vez)",
+        r.versoes_antes, r.versoes_depois, r.chaves_apagadas
+    );
     Ok(())
 }

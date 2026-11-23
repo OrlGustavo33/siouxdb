@@ -364,8 +364,14 @@ fn foto_nao_ve_gravacoes_novas_e_linha_grande_demais() {
     )
     .unwrap();
     t.inserir(&mut tx, &[1.into(), "primeira".into()]).unwrap();
+    // Linhas maiores que a página vão para o transbordo.
+    t.inserir(&mut tx, &[2.into(), "x".repeat(5000).into()])
+        .unwrap();
     assert!(matches!(
-        t.inserir(&mut tx, &[2.into(), "x".repeat(5000).into()]),
+        t.inserir(
+            &mut tx,
+            &[9.into(), "z".repeat(crate::log::MAXIMO_VALOR + 1).into()]
+        ),
         Err(ErroCatalogo::LinhaGrandeDemais { .. })
     ));
     // Linha quase do tamanho da página cabe.
@@ -383,7 +389,7 @@ fn foto_nao_ve_gravacoes_novas_e_linha_grande_demais() {
     );
     assert_eq!(
         t.varrer(&foto, None, None).unwrap().todas().unwrap().len(),
-        2
+        3
     );
     assert_eq!(
         t.varrer(&b.ler().unwrap(), None, None)
@@ -391,7 +397,7 @@ fn foto_nao_ve_gravacoes_novas_e_linha_grande_demais() {
             .todas()
             .unwrap()
             .len(),
-        3
+        4
     );
 }
 
@@ -601,4 +607,155 @@ fn modelo_de_tabelas_com_quedas() {
         }
     }
     assert!(quedas > 100, "poucas quedas: {quedas}");
+}
+
+#[test]
+fn linhas_grandes_historico_e_paginas_devolvidas() {
+    let vfs = disco(6);
+    let b = criar(&vfs, true, Config::default());
+    let cols = [
+        Coluna::nova("id", Tipo::Inteiro),
+        Coluna::nova("doc", Tipo::Bytes),
+    ];
+    let grande = |n: usize, s: u8| -> Vec<u8> {
+        (0..n)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(s))
+            .collect()
+    };
+    let mut tx = b.escrever().unwrap();
+    let t = criar_tabela(&mut tx, "docs", &cols, &["id"]).unwrap();
+    t.inserir(&mut tx, &[1.into(), grande(1 << 20, 1).into()])
+        .unwrap();
+    t.inserir(&mut tx, &[2.into(), grande(3000, 2).into()])
+        .unwrap();
+    t.inserir(&mut tx, &[3.into(), grande(10, 3).into()])
+        .unwrap();
+    let lsn1 = tx.confirmar().unwrap();
+    let mut tx = b.escrever().unwrap();
+    t.gravar(&mut tx, &[1.into(), grande(200_000, 9).into()])
+        .unwrap();
+    tx.confirmar().unwrap();
+    drop(b);
+    vfs.queda();
+    let b = abrir(&vfs, true, Config::default());
+    let l = b.ler().unwrap();
+    assert_eq!(
+        t.obter(&l, &[1.into()]).unwrap().unwrap()[1],
+        Valor::Bytes(grande(200_000, 9))
+    );
+    assert_eq!(
+        t.obter_em(&l, &[1.into()], lsn1).unwrap().unwrap()[1],
+        Valor::Bytes(grande(1 << 20, 1))
+    );
+    assert_eq!(
+        t.obter(&l, &[2.into()]).unwrap().unwrap()[1],
+        Valor::Bytes(grande(3000, 2))
+    );
+    assert_eq!(t.historico(&l, &[1.into()]).unwrap().len(), 2);
+    let total = l.meta().total_paginas;
+    drop(l);
+    // Apagar a tabela devolve também o transbordo: recriar e encher de novo não cresce o arquivo.
+    let mut tx = b.escrever().unwrap();
+    catalogo::remover_tabela(&mut tx, "docs").unwrap();
+    let t = criar_tabela(&mut tx, "docs", &cols, &["id"]).unwrap();
+    t.inserir(&mut tx, &[1.into(), grande(1 << 20, 1).into()])
+        .unwrap();
+    t.inserir(&mut tx, &[2.into(), grande(200_000, 9).into()])
+        .unwrap();
+    tx.confirmar().unwrap();
+    assert!(
+        b.ler().unwrap().meta().total_paginas <= total,
+        "transbordo vazou"
+    );
+}
+
+#[test]
+fn compactar_guarda_o_necessario_e_devolve_espaco() {
+    let vfs = disco(7);
+    let b = criar(&vfs, true, Config::default());
+    let mut tx = b.escrever().unwrap();
+    let t = criar_tabela(&mut tx, "c", &clientes(), &["id"]).unwrap();
+    tx.confirmar().unwrap();
+    // 200 linhas, cada uma alterada 30 vezes, metade removida no fim; uma grande.
+    let mut lsns = Vec::new();
+    for rodada in 0..30 {
+        let mut tx = b.escrever().unwrap();
+        for id in 0..200 {
+            t.gravar(
+                &mut tx,
+                &linha(id, &format!("R{rodada}-{}", "n".repeat(40)), rodada as f64),
+            )
+            .unwrap();
+        }
+        lsns.push(tx.confirmar().unwrap());
+    }
+    let mut tx = b.escrever().unwrap();
+    t.gravar(
+        &mut tx,
+        &[1000.into(), "G".repeat(50_000).into(), 1.0.into()],
+    )
+    .unwrap();
+    for id in 0..100 {
+        t.remover(&mut tx, &[id.into()]).unwrap();
+    }
+    let lsn_fim = tx.confirmar().unwrap();
+    let marco = lsns[27];
+    let como_estava = t
+        .varrer_em(&b.ler().unwrap(), None, None, marco)
+        .unwrap()
+        .todas()
+        .unwrap();
+    let atual = t
+        .varrer(&b.ler().unwrap(), None, None)
+        .unwrap()
+        .todas()
+        .unwrap();
+
+    // Mantém a partir do LSN da rodada 27.
+    let mut tx = b.escrever().unwrap();
+    let r = t.compactar(&mut tx, marco).unwrap();
+    tx.confirmar().unwrap();
+    assert_eq!(r.versoes_antes, 30 * 200 + 1 + 100);
+    assert_eq!(r.versoes_depois, 200 * 3 + 100 + 1);
+    let l = b.ler().unwrap();
+    assert_eq!(t.varrer(&l, None, None).unwrap().todas().unwrap(), atual);
+    assert_eq!(
+        t.varrer_em(&l, None, None, marco).unwrap().todas().unwrap(),
+        como_estava
+    );
+    assert_eq!(t.contagem(&l).unwrap().linhas, 101);
+    assert_eq!(t.historico(&l, &[150.into()]).unwrap().len(), 3);
+    t.verificar_indice(&l).unwrap();
+    drop(l);
+
+    // Só a versão atual: as removidas saem do índice e o espaço volta.
+    let mut tx = b.escrever().unwrap();
+    let r = t.compactar(&mut tx, u64::MAX).unwrap();
+    tx.confirmar().unwrap();
+    assert_eq!((r.versoes_depois, r.chaves_apagadas), (101, 100));
+    b.checkpoint().unwrap();
+    drop(b);
+    vfs.queda();
+    let b = abrir(&vfs, true, Config::default());
+    let l = b.ler().unwrap();
+    assert_eq!(t.varrer(&l, None, None).unwrap().todas().unwrap(), atual);
+    assert_eq!(t.historico(&l, &[150.into()]).unwrap().len(), 1);
+    assert_eq!(
+        t.obter_em(&l, &[150.into()], lsn_fim).unwrap(),
+        atual.iter().find(|x| x[0] == 150.into()).cloned()
+    );
+    assert_eq!(t.verificar_indice(&l).unwrap().entradas, 101);
+    let depois_de_compactar = l.meta().total_paginas;
+    drop(l);
+    // Gravar de novo (muitas versões) reaproveita as páginas liberadas: o arquivo não cresce.
+    let mut tx = b.escrever().unwrap();
+    for id in 0..2000 {
+        t.gravar(&mut tx, &linha(id, "NOVO", 0.0)).unwrap();
+    }
+    tx.confirmar().unwrap();
+    assert_eq!(
+        b.ler().unwrap().meta().total_paginas,
+        depois_de_compactar,
+        "espaço liberado não foi reaproveitado"
+    );
 }

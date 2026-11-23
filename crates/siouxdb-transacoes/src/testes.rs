@@ -512,3 +512,31 @@ fn modelo_com_quedas_em_qualquer_ponto() {
     }
     assert!(quedas > 100, "poucas quedas exercitadas: {quedas}");
 }
+
+#[test]
+fn copia_a_quente_abre_com_tudo_confirmado() {
+    for cifrado in [false, true] {
+        let vfs = disco(11);
+        let b = criar(&vfs, cifrado, Config::default());
+        let mut tx = b.escrever().unwrap();
+        let n = tx.alocar(TipoPagina::NoArvore).unwrap();
+        escrever(&mut tx, n, marca("antes"));
+        tx.confirmar().unwrap();
+        // Uma foto antiga aberta segura o checkpoint: a cópia precisa levar o WAL junto.
+        let foto = b.ler().unwrap();
+        let mut tx = b.escrever().unwrap();
+        escrever(&mut tx, n, marca("depois"));
+        tx.confirmar().unwrap();
+        let destino = Path::new("copia.sdb");
+        assert!(b.copiar_para(&vfs, destino).unwrap() > 0);
+        assert!(
+            b.copiar_para(&vfs, destino).is_err(),
+            "não sobrescreve cópia existente"
+        );
+        drop(foto);
+        drop(b);
+        let copia = B::abrir(&vfs, destino, cifrado.then_some(SENHA), Config::default()).unwrap();
+        assert_eq!(conteudo(&copia, n), marca("depois"));
+        assert!(!vfs.existe(Path::new("copia.sdb.parcial")).unwrap());
+    }
+}

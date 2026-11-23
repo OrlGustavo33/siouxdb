@@ -133,6 +133,12 @@ A raiz nunca muda de página. Chaves são comparadas como bytes; a separadora qu
 ### Log quente (livro-razão das versões)
 Página: `0..8` próxima página · `8..10` bytes usados · registros a partir do byte 16. Registro: tamanho u16 · marcas (bit 0 = remoção) · tamanho da chave u16 · versão anterior da mesma chave (ponteiro = página << 16 | posição) · LSN · instante (µs) · chave · linha. Nada é sobrescrito: cada gravação anexa uma versão.
 
+### Valores grandes (transbordo, página tipo 8)
+Quando chave + linha passam de metade do espaço de um registro, a linha vai para uma corrente de páginas de transbordo — `0..8` próxima página, `8..12` bytes nesta página, depois os bytes — e o registro guarda só `tamanho total (u64) · primeira página (u64)`, com o bit 1 das marcas ligado. Linha até 16 MiB; chave até ~1/4 da página.
+
+### Compactação
+Reescreve o log de uma tabela guardando, por chave, as versões posteriores ao LSN de corte e a que valia nele; chaves removidas até o corte saem do índice. O log antigo e os transbordos voltam para a lista de livres.
+
 ### Tabela e catálogo
 - Cabeçalho de tabela: raiz do índice, primeira e última página do log, versões, linhas (5 × u64).
 - O índice da chave primária leva à versão mais nova; remoção também é versão (o histórico continua alcançável).

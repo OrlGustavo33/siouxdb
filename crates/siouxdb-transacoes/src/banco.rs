@@ -554,6 +554,61 @@ impl<A: Arquivo> Banco<A> {
         Ok(())
     }
 
+    /// Cópia de segurança **a quente** para `destino` (e `destino-wal`), consistente na
+    /// última confirmação. Os leitores continuam; os escritores esperam só durante a cópia.
+    /// A cópia é gravada com nome temporário, sincronizada e renomeada no fim: ou existe
+    /// inteira, ou não existe. Abre com a mesma senha. Devolve os bytes copiados.
+    pub fn copiar_para<V: Vfs<Arquivo = A>>(&self, vfs: &V, destino: &Path) -> Resultado<u64> {
+        if vfs.existe(destino)? {
+            return Err(siouxdb_vfs::ErroVfs::JaExiste(destino.to_path_buf()).into());
+        }
+        let vez = self.fila.adquirir(self.config.espera_maxima_escritor)?;
+        // Checkpoint antes, para o WAL da cópia ficar pequeno. Com a vez de escrever na mão,
+        // nada muda o arquivo principal nem o WAL enquanto copiamos.
+        self.checkpoint_com_vez(&vez, false)?;
+        let fim_wal = self.travar().fim;
+        let temporario = |sufixo: &str| {
+            let mut s = destino.as_os_str().to_owned();
+            s.push(sufixo);
+            PathBuf::from(s)
+        };
+        let (tmp, tmp_wal, final_wal) = (
+            temporario(".parcial"),
+            temporario("-wal.parcial"),
+            temporario("-wal"),
+        );
+        let copiar = |ler: &dyn Fn(u64, &mut [u8]) -> Resultado<usize>,
+                      tamanho: u64,
+                      para: &Path|
+         -> Resultado<u64> {
+            let saida = vfs.abrir(para, ModoAbertura::CriarNovo)?;
+            let mut buf = vec![0u8; 1 << 20];
+            let mut pos = 0u64;
+            while pos < tamanho {
+                let n = (tamanho - pos).min(buf.len() as u64) as usize;
+                let lidos = ler(pos, &mut buf[..n])?;
+                if lidos == 0 {
+                    break;
+                }
+                saida.gravar_em(pos, &buf[..lidos])?;
+                pos += lidos as u64;
+            }
+            saida.sincronizar()?;
+            Ok(pos)
+        };
+        let principal = copiar(
+            &|pos, b| Ok(self.paginador.ler_bruto(pos, b)?),
+            self.paginador.tamanho_arquivo()?,
+            &tmp,
+        )?;
+        let wal = copiar(&|pos, b| Ok(self.wal.ler_em(pos, b)?), fim_wal, &tmp_wal)?;
+        drop(vez);
+        // O WAL entra primeiro: um principal sem o WAL dele seria uma cópia antiga.
+        vfs.renomear(&tmp_wal, &final_wal)?;
+        vfs.renomear(&tmp, destino)?;
+        Ok(principal + wal)
+    }
+
     /// Faz o checkpoint completo e fecha.
     pub fn fechar(self) -> Resultado<()> {
         self.checkpoint()

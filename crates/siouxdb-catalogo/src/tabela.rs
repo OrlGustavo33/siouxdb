@@ -69,6 +69,17 @@ pub struct VersaoLinha {
     pub linha: Option<Vec<Valor>>,
 }
 
+/// O que uma compactação fez.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResumoCompactacao {
+    /// Versões no log antes.
+    pub versoes_antes: u64,
+    /// Versões no log depois.
+    pub versoes_depois: u64,
+    /// Chaves removidas que saíram de vez do índice.
+    pub chaves_apagadas: u64,
+}
+
 /// Contagens de uma tabela.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Contagem {
@@ -257,6 +268,7 @@ impl Tabela {
             &mut cab.pontas,
             removendo,
             anterior,
+            tx.lsn(),
             agora(),
             chave,
             dados,
@@ -303,7 +315,8 @@ impl Tabela {
         let mut passos = 0u64;
         while !ponteiro.nenhum() {
             let (lsn, removida, anterior, linha) = log::ler_com(p, ponteiro, |v| {
-                let linha = (v.lsn <= ate && !v.removida).then(|| decodificar_linha(v.dados));
+                let linha = (v.lsn <= ate && !v.removida)
+                    .then(|| log::dados_completos(p, &v).and_then(|d| decodificar_linha(&d)));
                 (v.lsn, v.removida, v.anterior, linha)
             })?;
             if lsn <= ate {
@@ -364,7 +377,7 @@ impl Tabela {
         while !ponteiro.nenhum() {
             let (v, anterior) = log::ler_com(p, ponteiro, |v| {
                 let linha = (!v.removida)
-                    .then(|| decodificar_linha(v.dados))
+                    .then(|| log::dados_completos(p, &v).and_then(|d| decodificar_linha(&d)))
                     .transpose();
                 (
                     linha.map(|linha| VersaoLinha {
@@ -410,6 +423,91 @@ impl Tabela {
             cursor,
             lsn,
         })
+    }
+
+    /// **Compacta** o histórico: reescreve o log guardando só o que é preciso para ler a
+    /// tabela como estava em qualquer LSN `>= manter_desde`. Para cada chave ficam as
+    /// versões posteriores a `manter_desde` e a que valia nele (a "base"); chaves
+    /// removidas antes de `manter_desde` saem de vez. As páginas do log antigo (e os
+    /// transbordos) voltam para o banco.
+    ///
+    /// Com `manter_desde = u64::MAX` fica só a versão atual de cada linha. Leituras "como
+    /// estava" antes de `manter_desde` deixam de ser exatas. Roda numa transação só: a
+    /// tabela inteira passa pela memória.
+    pub fn compactar<P: PaginasMut + ?Sized>(
+        &self,
+        tx: &mut P,
+        manter_desde: u64,
+    ) -> Resultado<ResumoCompactacao> {
+        let mut cab = Cab::ler(tx, self.def.cabecalho)?;
+        let mut entradas = Vec::new();
+        {
+            let mut c = Cursor::novo(tx, cab.raiz, None, None)?;
+            while let Some(e) =
+                c.proximo_com(|k, v| Ponteiro::de_bytes(v).map(|p| (k.to_vec(), p)))?
+            {
+                entradas.push(e?);
+            }
+        }
+        let mut novo = Pontas::default();
+        let mut r = ResumoCompactacao {
+            versoes_antes: cab.versoes,
+            ..ResumoCompactacao::default()
+        };
+        let mut linhas = 0;
+        for (chave, mut ponteiro) in entradas {
+            // Da mais nova para a mais antiga, até a primeira com LSN <= `manter_desde` (a base).
+            let mut guardar: Vec<(bool, u64, u64, Vec<u8>)> = Vec::new();
+            while !ponteiro.nenhum() {
+                let (versao, anterior) = log::ler_com(tx, ponteiro, |v| {
+                    let dados = if v.removida {
+                        Ok(Vec::new())
+                    } else {
+                        log::dados_completos(tx, &v).map(|d| d.into_owned())
+                    };
+                    (
+                        dados.map(|d| (v.removida, v.lsn, v.instante, d)),
+                        v.anterior,
+                    )
+                })?;
+                let versao = versao?;
+                let base = versao.1 <= manter_desde;
+                guardar.push(versao);
+                if base {
+                    break;
+                }
+                ponteiro = anterior;
+            }
+            // Base que é remoção não precisa ficar (antes dela não há nada a ler).
+            if guardar
+                .last()
+                .is_some_and(|(removida, lsn, ..)| *removida && *lsn <= manter_desde)
+            {
+                guardar.pop();
+            }
+            if guardar.is_empty() {
+                arvore::remover(tx, cab.raiz, &chave)?;
+                r.chaves_apagadas += 1;
+                continue;
+            }
+            if !guardar[0].0 {
+                linhas += 1;
+            }
+            let mut anterior = Ponteiro::NENHUM;
+            for (removida, lsn, instante, dados) in guardar.iter().rev() {
+                anterior = log::anexar(
+                    tx, &mut novo, *removida, anterior, *lsn, *instante, &chave, dados,
+                )?;
+                r.versoes_depois += 1;
+            }
+            arvore::inserir(tx, cab.raiz, &chave, &anterior.bytes())?;
+        }
+        log::liberar(tx, cab.pontas.primeira)?;
+        cab.pontas = novo;
+        cab.versoes = r.versoes_depois;
+        cab.linhas = linhas;
+        cab.gravar(tx, self.def.cabecalho)?;
+        Ok(r)
     }
 
     /// Quantas linhas e versões a tabela tem.

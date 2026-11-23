@@ -84,7 +84,8 @@ Só o motor é obrigatório; o resto é opcional. Embutido (como o SQLite) ou se
 - `siouxdb-transacoes`: **WAL** com CRC encadeado, transações **tudo ou nada**, um escritor por vez em **fila justa**, **confirmação em grupo**, leitores com **foto** que nunca esperam, checkpoint automático e **trava de arquivo**. Sincronia configurável (`Total`: nada confirmado se perde; `Normal`: mais rápido). Testado com um modelo que roda transações e quedas de energia aleatórias nos quatro modos (claro/cifrado × Total/Normal);
 - `siouxdb-indices`: **árvore B+** em páginas (chaves de tamanho variável, separadora curta, cursor por faixa, verificador de estrutura), testada contra o `BTreeMap` do Rust com milhares de operações aleatórias;
 - `siouxdb-catalogo`: **tabelas versionadas** — a camada quente é um livro-razão onde toda gravação anexa uma versão; índice da chave primária; histórico por linha e leitura **como estava no LSN tal**; catálogo com `sys_tabelas` e `sys_colunas`;
-- comando `sioux criar | info | verificar | trocar-senha | checkpoint | tabelas`.
+- **valores grandes** (linha de até 16 MiB, em páginas de transbordo), **compactação** do histórico e **backup a quente**;
+- comando `sioux criar | info | verificar | trocar-senha | checkpoint | tabelas | backup | compactar`.
 - `siouxdb-metricas`: histograma sem trava, séries de 60 s e alertas configuráveis;
 - **SiouxDB Studio** (`studio/`, Tauri): painel de monitoramento em tempo real sobre um arquivo ou uma demonstração com carga gerada.
 
