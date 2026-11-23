@@ -32,8 +32,10 @@ pub type NumeroPagina = u64;
 /// Assinatura dos arquivos do SiouxDB.
 pub const MAGICA: [u8; 8] = *b"SIOUXDB\0";
 
-/// Versão do formato gravada por esta biblioteca. Zero = ainda instável.
-pub const VERSAO_FORMATO: u32 = 0;
+/// Versão do formato gravada por esta biblioteca. A versão 1 está **congelada**: versões
+/// futuras do SiouxDB continuam abrindo arquivos da versão 1 (os arquivos de exemplo em
+/// `spec/exemplos/` são abertos em todo CI).
+pub const VERSAO_FORMATO: u32 = 1;
 
 /// As duas primeiras páginas guardam as duas cópias do cabeçalho.
 pub const PAGINAS_RESERVADAS: NumeroPagina = 2;

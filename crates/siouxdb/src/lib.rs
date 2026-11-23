@@ -33,8 +33,10 @@ pub use siouxdb_metricas as metricas;
 /// Versão desta biblioteca.
 pub const VERSAO: &str = env!("CARGO_PKG_VERSION");
 
-/// Versão do formato de arquivo que esta biblioteca grava. Zero = ainda instável.
+/// Versão do formato de arquivo que esta biblioteca grava (a 1 está congelada).
 pub const VERSAO_FORMATO: u32 = siouxdb_armazenamento::VERSAO_FORMATO;
+
+pub mod manutencao;
 
 /// Banco num arquivo do disco de verdade (o tipo que um programa normalmente usa).
 pub type BancoArquivo = transacoes::Banco<<vfs::VfsReal as vfs::Vfs>::Arquivo>;

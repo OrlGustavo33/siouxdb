@@ -438,7 +438,7 @@ fn modelo_com_quedas_em_qualquer_ponto() {
         (true, Sincronia::Normal),
     ];
     let mut quedas = 0;
-    for semente in 0..60u64 {
+    for semente in 0..60 * fator_simulacao() {
         for (cifrado, sincronia) in modos {
             let ctx0 = format!("semente {semente}, cifrado {cifrado}, {sincronia:?}");
             let vfs = disco(semente);
@@ -539,4 +539,12 @@ fn copia_a_quente_abre_com_tudo_confirmado() {
         assert_eq!(conteudo(&copia, n), marca("depois"));
         assert!(!vfs.existe(Path::new("copia.sdb.parcial")).unwrap());
     }
+}
+
+/// Multiplicador das rodadas de simulação (`SIOUX_SIM_FATOR`, usado na rodada noturna do CI).
+fn fator_simulacao() -> u64 {
+    std::env::var("SIOUX_SIM_FATOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
 }

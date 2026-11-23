@@ -427,6 +427,11 @@ impl<A: Arquivo> Paginador<A> {
         Pagina::de_bytes(dados, numero)
     }
 
+    /// Muda quantas páginas o cache guarda.
+    pub fn definir_capacidade_cache(&self, paginas: usize) {
+        self.travar_cache().definir_capacidade(paginas);
+    }
+
     /// Lê bytes crus do arquivo (como estão no disco), para cópia de segurança.
     pub fn ler_bruto(&self, posicao: u64, destino: &mut [u8]) -> Resultado<usize> {
         Ok(self.arquivo.ler_em(posicao, destino)?)

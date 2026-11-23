@@ -64,13 +64,37 @@ pub(crate) enum Conflito {
     Substituir,
 }
 
+/// Definição de coluna num CREATE TABLE ou ALTER TABLE.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ColDef {
+    pub nome: String,
+    pub tipo: Tipo,
+    pub nao_nulo: bool,
+    pub padrao: Option<Expr>,
+    pub auto: bool,
+    pub chave: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Comando {
     CriarTabela {
         nome: String,
         se_nao_existe: bool,
-        colunas: Vec<(String, Tipo, bool)>,
+        colunas: Vec<ColDef>,
         chave: Vec<String>,
+    },
+    AdicionarColuna {
+        tabela: String,
+        coluna: ColDef,
+    },
+    RenomearTabela {
+        de: String,
+        para: String,
+    },
+    RenomearColuna {
+        tabela: String,
+        de: String,
+        para: String,
     },
     ApagarTabela {
         nome: String,
@@ -272,6 +296,10 @@ impl Parser {
                 Comando::ApagarIndice { nome, se_existe }
             });
         }
+        if self.chave("alter") {
+            self.espera_chave("table")?;
+            return self.alterar_tabela();
+        }
         if self.eh_chave("insert") || self.eh_chave("replace") {
             return self.inserir();
         }
@@ -316,7 +344,7 @@ impl Parser {
             return Ok(Comando::Remover { tabela, onde });
         }
         self.erro(
-            "comando desconhecido (use CREATE, DROP, INSERT, SELECT, UPDATE, DELETE ou EXPLAIN)",
+            "comando desconhecido (use CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, DELETE ou EXPLAIN)",
         )
     }
 
@@ -329,19 +357,33 @@ impl Parser {
         Ok(false)
     }
 
-    fn tipo(&mut self) -> Resultado<Tipo> {
+    /// Tipo da coluna; o segundo valor diz se é de numeração automática (SERIAL).
+    fn tipo(&mut self) -> Resultado<(Tipo, bool)> {
         let Tok::Nome { texto, .. } = self.tok().clone() else {
             return self.erro("esperava o tipo da coluna");
         };
+        let mut auto = false;
         let t = match texto.as_str() {
             "inteiro" | "int" | "integer" | "bigint" | "smallint" | "int8" | "int4" => {
                 Tipo::Inteiro
             }
-            "real" | "float" | "double" | "numeric" | "decimal" | "float8" => Tipo::Real,
+            "serial" | "bigserial" => {
+                auto = true;
+                Tipo::Inteiro
+            }
+            "real" | "float" | "double" | "float8" => Tipo::Real,
+            "decimal" | "numeric" | "dinheiro" | "money" => Tipo::Decimal,
             "texto" | "text" | "varchar" | "char" | "string" => Tipo::Texto,
             "bytes" | "blob" | "bytea" => Tipo::Bytes,
             "booleano" | "bool" | "boolean" => Tipo::Booleano,
-            _ => return self.erro("tipo desconhecido (INTEIRO, REAL, TEXTO, BYTES ou BOOLEANO)"),
+            "datahora" | "timestamp" | "timestamptz" | "datetime" | "date" | "data" => {
+                Tipo::DataHora
+            }
+            _ => {
+                return self.erro(
+                    "tipo desconhecido (INTEIRO, DECIMAL, REAL, TEXTO, BYTES, BOOLEANO ou DATAHORA)",
+                );
+            }
         };
         self.avancar();
         self.chave("precision");
@@ -354,14 +396,47 @@ impl Parser {
                 self.avancar();
             }
         }
-        Ok(t)
+        Ok((t, auto))
+    }
+
+    /// `nome TIPO [NOT NULL] [DEFAULT expr] [PRIMARY KEY] [AUTOINCREMENT]`
+    fn coluna(&mut self) -> Resultado<ColDef> {
+        let nome = self.nome()?;
+        let (tipo, auto) = self.tipo()?;
+        let mut c = ColDef {
+            nome,
+            tipo,
+            nao_nulo: false,
+            padrao: None,
+            auto,
+            chave: false,
+        };
+        loop {
+            if self.chave("not") {
+                self.espera_chave("null")?;
+                c.nao_nulo = true;
+            } else if self.chave("null") {
+            } else if self.chave("primary") {
+                self.espera_chave("key")?;
+                c.chave = true;
+            } else if self.chave("default") {
+                c.padrao = Some(self.unario()?);
+            } else if self.chave("autoincrement")
+                || self.chave("autoincremento")
+                || self.chave("auto_increment")
+            {
+                c.auto = true;
+            } else {
+                return Ok(c);
+            }
+        }
     }
 
     fn criar_tabela(&mut self) -> Resultado<Comando> {
         let se_nao_existe = self.se_nao_existe()?;
         let nome = self.nome()?;
         self.espera("(")?;
-        let (mut colunas, mut chave) = (Vec::new(), Vec::new());
+        let (mut colunas, mut chave): (Vec<ColDef>, Vec<String>) = (Vec::new(), Vec::new());
         loop {
             if self.chave("primary") {
                 self.espera_chave("key")?;
@@ -370,25 +445,14 @@ impl Parser {
                 }
                 chave = self.lista_nomes()?;
             } else {
-                let c = self.nome()?;
-                let t = self.tipo()?;
-                let mut nao_nulo = false;
-                loop {
-                    if self.chave("not") {
-                        self.espera_chave("null")?;
-                        nao_nulo = true;
-                    } else if self.chave("null") {
-                    } else if self.chave("primary") {
-                        self.espera_chave("key")?;
-                        if !chave.is_empty() {
-                            return self.erro("PRIMARY KEY repetida");
-                        }
-                        chave = vec![c.clone()];
-                    } else {
-                        break;
+                let c = self.coluna()?;
+                if c.chave {
+                    if !chave.is_empty() {
+                        return self.erro("PRIMARY KEY repetida");
                     }
+                    chave = vec![c.nome.clone()];
                 }
-                colunas.push((c, t, nao_nulo));
+                colunas.push(c);
             }
             if !self.simbolo(",") {
                 break;
@@ -404,6 +468,35 @@ impl Parser {
             colunas,
             chave,
         })
+    }
+
+    fn alterar_tabela(&mut self) -> Resultado<Comando> {
+        let tabela = self.nome()?;
+        if self.chave("add") {
+            self.chave("column");
+            let coluna = self.coluna()?;
+            if coluna.chave || coluna.auto {
+                return self.erro("coluna acrescentada não pode ser PRIMARY KEY nem automática");
+            }
+            return Ok(Comando::AdicionarColuna { tabela, coluna });
+        }
+        if self.chave("rename") {
+            if self.chave("to") {
+                return Ok(Comando::RenomearTabela {
+                    de: tabela,
+                    para: self.nome()?,
+                });
+            }
+            self.chave("column");
+            let de = self.nome()?;
+            self.espera_chave("to")?;
+            return Ok(Comando::RenomearColuna {
+                tabela,
+                de,
+                para: self.nome()?,
+            });
+        }
+        self.erro("esperava ADD COLUMN, RENAME TO ou RENAME COLUMN")
     }
 
     fn inserir(&mut self) -> Resultado<Comando> {
@@ -717,6 +810,10 @@ impl Parser {
                         "false" | "falso" => {
                             self.avancar();
                             return Ok(Expr::Valor(Valor::Booleano(false)));
+                        }
+                        "current_timestamp" => {
+                            self.avancar();
+                            return Ok(Expr::Funcao("agora".into(), Vec::new(), false));
                         }
                         _ => {}
                     }

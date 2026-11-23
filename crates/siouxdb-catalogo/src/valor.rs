@@ -4,6 +4,7 @@
 //!   positivos, textos em ordem, chaves compostas coluna a coluna). É o que entra na árvore;
 //! - **de linha**: compacta, sem ordem, para guardar no log.
 
+use crate::decimal::Decimal;
 use crate::{ErroCatalogo, Resultado};
 use std::cmp::Ordering;
 
@@ -20,6 +21,10 @@ pub enum Tipo {
     Bytes,
     /// Verdadeiro ou falso.
     Booleano,
+    /// Decimal exato com 10 casas (dinheiro, quantidades).
+    Decimal,
+    /// Data e hora (microssegundos desde 1970, UTC).
+    DataHora,
 }
 
 impl Tipo {
@@ -31,6 +36,8 @@ impl Tipo {
             Tipo::Texto => "TEXTO",
             Tipo::Bytes => "BYTES",
             Tipo::Booleano => "BOOLEANO",
+            Tipo::Decimal => "DECIMAL",
+            Tipo::DataHora => "DATAHORA",
         }
     }
 
@@ -41,6 +48,8 @@ impl Tipo {
             Tipo::Texto => 3,
             Tipo::Bytes => 4,
             Tipo::Booleano => 5,
+            Tipo::Decimal => 6,
+            Tipo::DataHora => 7,
         }
     }
 
@@ -51,6 +60,8 @@ impl Tipo {
             3 => Tipo::Texto,
             4 => Tipo::Bytes,
             5 => Tipo::Booleano,
+            6 => Tipo::Decimal,
+            7 => Tipo::DataHora,
             _ => return None,
         })
     }
@@ -71,6 +82,10 @@ pub enum Valor {
     Bytes(Vec<u8>),
     /// Booleano.
     Booleano(bool),
+    /// Decimal exato.
+    Decimal(Decimal),
+    /// Data e hora (µs desde 1970, UTC).
+    DataHora(i64),
 }
 
 impl Valor {
@@ -83,6 +98,8 @@ impl Valor {
             Valor::Texto(_) => Tipo::Texto,
             Valor::Bytes(_) => Tipo::Bytes,
             Valor::Booleano(_) => Tipo::Booleano,
+            Valor::Decimal(_) => Tipo::Decimal,
+            Valor::DataHora(_) => Tipo::DataHora,
         })
     }
 
@@ -93,6 +110,8 @@ impl Valor {
             match v {
                 Valor::Nulo => 0,
                 Valor::Booleano(_) => 1,
+                Valor::Decimal(_) => 6,
+                Valor::DataHora(_) => 7,
                 Valor::Inteiro(_) => 2,
                 Valor::Real(_) => 3,
                 Valor::Texto(_) => 4,
@@ -101,6 +120,8 @@ impl Valor {
         }
         match (self, outro) {
             (Valor::Booleano(a), Valor::Booleano(b)) => a.cmp(b),
+            (Valor::Decimal(a), Valor::Decimal(b)) => a.cmp(b),
+            (Valor::DataHora(a), Valor::DataHora(b)) => a.cmp(b),
             (Valor::Inteiro(a), Valor::Inteiro(b)) => a.cmp(b),
             (Valor::Real(a), Valor::Real(b)) => a.total_cmp(b),
             (Valor::Texto(a), Valor::Texto(b)) => a.as_bytes().cmp(b.as_bytes()),
@@ -118,6 +139,11 @@ impl From<i64> for Valor {
 impl From<f64> for Valor {
     fn from(v: f64) -> Self {
         Valor::Real(v)
+    }
+}
+impl From<Decimal> for Valor {
+    fn from(v: Decimal) -> Self {
+        Valor::Decimal(v)
     }
 }
 impl From<bool> for Valor {
@@ -160,6 +186,14 @@ pub fn codificar_chave(valores: &[Valor]) -> Resultado<Vec<u8>> {
         match v {
             Valor::Nulo => s.push(0),
             Valor::Booleano(b) => s.extend_from_slice(&[1, u8::from(*b)]),
+            Valor::Decimal(d) => {
+                s.push(6);
+                s.extend_from_slice(&((d.bruto() as u128) ^ (1 << 127)).to_be_bytes());
+            }
+            Valor::DataHora(t) => {
+                s.push(7);
+                s.extend_from_slice(&((*t as u64) ^ (1 << 63)).to_be_bytes());
+            }
             Valor::Inteiro(i) => {
                 s.push(2);
                 s.extend_from_slice(&((*i as u64) ^ (1 << 63)).to_be_bytes());
@@ -218,6 +252,14 @@ pub fn codificar_linha(valores: &[Valor]) -> Vec<u8> {
                 s.extend_from_slice(b);
             }
             Valor::Booleano(b) => s.extend_from_slice(&[5, u8::from(*b)]),
+            Valor::Decimal(d) => {
+                s.push(6);
+                s.extend_from_slice(&d.bruto().to_le_bytes());
+            }
+            Valor::DataHora(t) => {
+                s.push(7);
+                s.extend_from_slice(&t.to_le_bytes());
+            }
         }
     }
     s
@@ -253,6 +295,10 @@ pub fn decodificar_linha(mut b: &[u8]) -> Resultado<Vec<Valor>> {
                 }
             }
             5 => Valor::Booleano(tirar(&mut b, 1)?[0] != 0),
+            6 => Valor::Decimal(Decimal::de_bruto(i128::from_le_bytes(
+                tirar(&mut b, 16)?.try_into().expect("16"),
+            ))),
+            7 => Valor::DataHora(i64::from_le_bytes(tirar(&mut b, 8)?.try_into().expect("8"))),
             _ => return Err(RUIM),
         });
     }
@@ -311,7 +357,26 @@ mod testes {
                             .collect(),
                     )
                 }
-                _ => Valor::Booleano(self.ate(2) == 1),
+                4 => Valor::Booleano(self.ate(2) == 1),
+                5 => {
+                    let especiais = [
+                        i128::MIN,
+                        -1,
+                        0,
+                        1,
+                        i128::MAX,
+                        -10_000_000_000,
+                        10_000_000_000,
+                        5,
+                    ];
+                    Valor::Decimal(Decimal::de_bruto(
+                        especiais[self.ate(8) as usize] >> self.ate(100),
+                    ))
+                }
+                _ => Valor::DataHora(
+                    [i64::MIN, -1, 0, 1, i64::MAX, 1_795_392_000_000_000][self.ate(6) as usize]
+                        >> self.ate(40),
+                ),
             }
         }
     }
@@ -321,7 +386,7 @@ mod testes {
         let mut s = Sorteio(42);
         for _ in 0..40_000 {
             // Chaves compostas de até 3 colunas, com os mesmos tipos nas duas.
-            let tipos: Vec<u64> = (0..1 + s.ate(3)).map(|_| s.ate(5)).collect();
+            let tipos: Vec<u64> = (0..1 + s.ate(3)).map(|_| s.ate(7)).collect();
             let a: Vec<Valor> = tipos.iter().map(|&t| s.valor(t)).collect();
             let b: Vec<Valor> = tipos.iter().map(|&t| s.valor(t)).collect();
             let logica = a
@@ -355,8 +420,8 @@ mod testes {
         for _ in 0..5000 {
             let linha: Vec<Valor> = (0..s.ate(8))
                 .map(|_| {
-                    let t = s.ate(6);
-                    if t == 5 { Valor::Nulo } else { s.valor(t) }
+                    let t = s.ate(8);
+                    if t == 7 { Valor::Nulo } else { s.valor(t) }
                 })
                 .collect();
             let bytes = codificar_linha(&linha);

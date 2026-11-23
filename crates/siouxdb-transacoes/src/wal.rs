@@ -21,7 +21,7 @@ use siouxdb_armazenamento::{Meta, NumeroPagina, Paginador, TAMANHO_ID, crc32c, c
 use siouxdb_vfs::Arquivo;
 
 pub(crate) const MAGICA_WAL: [u8; 8] = *b"SIOUXWAL";
-pub(crate) const VERSAO_WAL: u32 = 0;
+pub(crate) const VERSAO_WAL: u32 = 1;
 pub(crate) const TAMANHO_CABECALHO_WAL: u64 = 64;
 pub(crate) const TAMANHO_QUADRO: usize = 40;
 pub(crate) const TIPO_PAGINA: u8 = 1;

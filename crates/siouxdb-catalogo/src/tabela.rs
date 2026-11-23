@@ -12,8 +12,20 @@ use siouxdb_indices::arvore::{self, Cursor, ResumoArvore};
 use siouxdb_transacoes::{Paginas, PaginasMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Valor que a coluna recebe quando a gravação não informa um.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Padrao {
+    /// Nenhum (fica nulo).
+    #[default]
+    Nenhum,
+    /// Um valor fixo.
+    Valor(Valor),
+    /// A data e hora do momento da gravação.
+    Agora,
+}
+
 /// Uma coluna.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Coluna {
     /// Nome (minúsculas, sem acento).
     pub nome: String,
@@ -21,6 +33,8 @@ pub struct Coluna {
     pub tipo: Tipo,
     /// Recusa nulo? (Colunas da chave primária sempre recusam.)
     pub nao_nulo: bool,
+    /// Valor padrão.
+    pub padrao: Padrao,
 }
 
 impl Coluna {
@@ -30,6 +44,7 @@ impl Coluna {
             nome: nome.to_string(),
             tipo,
             nao_nulo: false,
+            padrao: Padrao::Nenhum,
         }
     }
 
@@ -39,12 +54,19 @@ impl Coluna {
             nome: nome.to_string(),
             tipo,
             nao_nulo: true,
+            padrao: Padrao::Nenhum,
         }
+    }
+
+    /// A mesma coluna com um valor padrão.
+    pub fn com_padrao(mut self, padrao: Padrao) -> Coluna {
+        self.padrao = padrao;
+        self
     }
 }
 
 /// Definição de uma tabela, como está no catálogo.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DefTabela {
     /// Identificador (nunca reaproveitado).
     pub id: u64,
@@ -58,6 +80,8 @@ pub struct DefTabela {
     pub cabecalho: NumeroPagina,
     /// Índices secundários.
     pub indices: Vec<DefIndice>,
+    /// Coluna de numeração automática (inteira), se houver.
+    pub auto: Option<usize>,
 }
 
 /// Um índice secundário: leva dos valores de algumas colunas à chave primária. Guarda o
@@ -112,6 +136,8 @@ struct Cab {
     pontas: Pontas,
     versoes: u64,
     linhas: u64,
+    /// Maior número já usado na coluna de numeração automática.
+    ultimo_auto: i64,
 }
 
 const RUIM: ErroCatalogo = ErroCatalogo::Corrompido("cabeçalho de tabela com forma inesperada");
@@ -132,6 +158,7 @@ impl Cab {
             },
             versoes: v(3),
             linhas: v(4),
+            ultimo_auto: v(5) as i64,
         })
     }
 
@@ -143,6 +170,7 @@ impl Cab {
             self.pontas.cauda,
             self.versoes,
             self.linhas,
+            self.ultimo_auto as u64,
         ]
         .into_iter()
         .enumerate()
@@ -167,7 +195,7 @@ enum Modo {
 }
 
 /// Uma tabela aberta.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tabela {
     def: DefTabela,
 }
@@ -314,10 +342,15 @@ impl Tabela {
             dados,
         )?;
         arvore::inserir(tx, cab.raiz, chave, &ponteiro.bytes())?;
-        cab.versoes += 1;
+        cab.versoes = cab.versoes.saturating_add(1);
+        if let (Some(i), Some(nova)) = (self.def.auto, linha) {
+            if let Valor::Inteiro(v) = nova[i] {
+                cab.ultimo_auto = cab.ultimo_auto.max(v);
+            }
+        }
         match (existia, removendo) {
-            (false, false) => cab.linhas += 1,
-            (true, true) => cab.linhas -= 1,
+            (false, false) => cab.linhas = cab.linhas.saturating_add(1),
+            (true, true) => cab.linhas = cab.linhas.saturating_sub(1),
             _ => {}
         }
         cab.gravar(tx, self.def.cabecalho)?;
@@ -425,6 +458,55 @@ impl Tabela {
         self.def.chave.iter().map(|&i| linha[i].clone()).collect()
     }
 
+    /// Completa uma linha parcial (`None` = não informado) com os valores padrão e a
+    /// numeração automática. Devolve a linha pronta para [`Tabela::inserir`].
+    pub fn preencher<P: Paginas + ?Sized>(
+        &self,
+        p: &P,
+        parcial: Vec<Option<Valor>>,
+    ) -> Resultado<Vec<Valor>> {
+        if parcial.len() != self.def.colunas.len() {
+            return Err(self.invalida(format!(
+                "esperava {} valores, vieram {}",
+                self.def.colunas.len(),
+                parcial.len()
+            )));
+        }
+        let mut linha = Vec::with_capacity(parcial.len());
+        for (i, (v, c)) in parcial.into_iter().zip(&self.def.colunas).enumerate() {
+            let auto = self.def.auto == Some(i);
+            linha.push(match v {
+                Some(Valor::Nulo) | None if auto => {
+                    let cab = Cab::ler(p, self.def.cabecalho)?;
+                    let proximo = cab
+                        .ultimo_auto
+                        .checked_add(1)
+                        .ok_or(ErroCatalogo::Corrompido("numeração automática esgotada"))?;
+                    Valor::Inteiro(proximo)
+                }
+                Some(v) => v,
+                None => match &c.padrao {
+                    Padrao::Nenhum => Valor::Nulo,
+                    Padrao::Valor(v) => v.clone(),
+                    Padrao::Agora => Valor::DataHora(crate::datahora::agora()),
+                },
+            });
+        }
+        Ok(linha)
+    }
+
+    /// Linhas gravadas antes de uma coluna ser acrescentada são mais curtas: completa com o
+    /// valor padrão da coluna (ou nulo).
+    fn ajustar(&self, mut linha: Vec<Valor>) -> Vec<Valor> {
+        for c in self.def.colunas.iter().skip(linha.len()) {
+            linha.push(match &c.padrao {
+                Padrao::Valor(v) => v.clone(),
+                _ => Valor::Nulo,
+            });
+        }
+        linha
+    }
+
     /// Linha na versão que valia no LSN `ate` (`u64::MAX` = a mais nova).
     fn resolver<P: Paginas + ?Sized>(
         &self,
@@ -435,8 +517,10 @@ impl Tabela {
         let mut passos = 0u64;
         while !ponteiro.nenhum() {
             let (lsn, removida, anterior, linha) = log::ler_com(p, ponteiro, |v| {
-                let linha = (v.lsn <= ate && !v.removida)
-                    .then(|| log::dados_completos(p, &v).and_then(|d| decodificar_linha(&d)));
+                let linha = (v.lsn <= ate && !v.removida).then(|| {
+                    log::dados_completos(p, &v)
+                        .and_then(|d| decodificar_linha(&d).map(|l| self.ajustar(l)))
+                });
                 (v.lsn, v.removida, v.anterior, linha)
             })?;
             if lsn <= ate {
@@ -448,7 +532,8 @@ impl Tabela {
             }
             ponteiro = anterior;
             passos += 1;
-            if passos > 1 << 40 {
+            // Uma corrente não pode ter mais versões do que cabem no banco.
+            if passos > limite_de_versoes(p) {
                 return Err(ErroCatalogo::Corrompido("corrente de versões sem fim"));
             }
         }
@@ -497,7 +582,10 @@ impl Tabela {
         while !ponteiro.nenhum() {
             let (v, anterior) = log::ler_com(p, ponteiro, |v| {
                 let linha = (!v.removida)
-                    .then(|| log::dados_completos(p, &v).and_then(|d| decodificar_linha(&d)))
+                    .then(|| {
+                        log::dados_completos(p, &v)
+                            .and_then(|d| decodificar_linha(&d).map(|l| self.ajustar(l)))
+                    })
                     .transpose();
                 (
                     linha.map(|linha| VersaoLinha {
@@ -510,6 +598,9 @@ impl Tabela {
             })?;
             versoes.push(v?);
             ponteiro = anterior;
+            if versoes.len() as u64 > limite_de_versoes(p) {
+                return Err(ErroCatalogo::Corrompido("corrente de versões sem fim"));
+            }
         }
         Ok(versoes)
     }
@@ -609,6 +700,9 @@ impl Tabela {
                     )
                 })?;
                 let versao = versao?;
+                if guardar.len() as u64 > limite_de_versoes(tx) {
+                    return Err(ErroCatalogo::Corrompido("corrente de versões sem fim"));
+                }
                 let base = versao.1 <= manter_desde;
                 guardar.push(versao);
                 if base {
@@ -707,4 +801,11 @@ pub fn fim_do_prefixo(prefixo: &[u8]) -> Vec<u8> {
     let mut f = prefixo.to_vec();
     f.push(0xFF);
     f
+}
+
+/// Teto de versões que cabem no banco (para parar correntes em laço num arquivo estragado).
+fn limite_de_versoes<P: Paginas + ?Sized>(p: &P) -> u64 {
+    p.meta()
+        .total_paginas
+        .saturating_mul(p.tamanho_conteudo() as u64 / 32 + 1)
 }

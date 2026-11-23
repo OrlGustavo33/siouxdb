@@ -42,9 +42,10 @@ pub struct Config {
     pub checkpoint_apos_paginas: u64,
     /// Tempo máximo esperando a vez de escrever.
     pub espera_maxima_escritor: Duration,
-    /// Páginas do arquivo principal guardadas em memória.
+    /// Páginas do arquivo principal guardadas em memória. **0 = automático**: 1/8 da
+    /// memória da máquina, entre 16 MiB e 512 MiB.
     pub cache_paginas: usize,
-    /// Páginas do WAL guardadas em memória.
+    /// Páginas do WAL guardadas em memória. 0 = automático (1/4 do cache principal).
     pub cache_wal: usize,
 }
 
@@ -54,8 +55,8 @@ impl Default for Config {
             sincronia: Sincronia::Total,
             checkpoint_apos_paginas: 1000,
             espera_maxima_escritor: Duration::from_secs(5),
-            cache_paginas: 1024,
-            cache_wal: 256,
+            cache_paginas: 0,
+            cache_wal: 0,
         }
     }
 }
@@ -151,6 +152,22 @@ pub struct Banco<A: Arquivo> {
     latencia: Histograma,
 }
 
+/// Memória total da máquina em bytes (Linux; nos outros sistemas supõe 1 GiB).
+fn memoria_total() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            let linha = s.lines().find(|l| l.starts_with("MemTotal:"))?;
+            linha.split_whitespace().nth(1)?.parse::<u64>().ok()
+        })
+        .map_or(1 << 30, |kib| kib * 1024)
+}
+
+/// Tamanho do cache no modo automático: 1/8 da memória, entre 16 MiB e 512 MiB.
+pub fn cache_automatico_bytes() -> u64 {
+    (memoria_total() / 8).clamp(16 << 20, 512 << 20)
+}
+
 fn caminho_wal(caminho: &Path) -> PathBuf {
     let mut s = caminho.as_os_str().to_owned();
     s.push("-wal");
@@ -173,7 +190,8 @@ impl<A: Arquivo> Banco<A> {
         senha: Option<SenhaNova<'_>>,
         config: Config,
     ) -> Resultado<Self> {
-        let paginador = Paginador::criar_com(vfs, caminho, tamanho, config.cache_paginas, senha)?;
+        let paginador =
+            Paginador::criar_com(vfs, caminho, tamanho, config.cache_paginas.max(1), senha)?;
         Self::montar(vfs, caminho, paginador, config)
     }
 
@@ -184,7 +202,7 @@ impl<A: Arquivo> Banco<A> {
         senha: Option<&[u8]>,
         config: Config,
     ) -> Resultado<Self> {
-        let paginador = Paginador::abrir_com(vfs, caminho, config.cache_paginas, senha)?;
+        let paginador = Paginador::abrir_com(vfs, caminho, config.cache_paginas.max(1), senha)?;
         Self::montar(vfs, caminho, paginador, config)
     }
 
@@ -260,8 +278,18 @@ impl<A: Arquivo> Banco<A> {
                 wal.sincronizar()?;
             }
         }
+        // Cache automático: só agora se sabe o tamanho da página.
+        let cache_paginas = match config.cache_paginas {
+            0 => (cache_automatico_bytes() / tam as u64) as usize,
+            n => n,
+        };
+        paginador.definir_capacidade_cache(cache_paginas);
+        let cache_wal = match config.cache_wal {
+            0 => (cache_paginas / 4).max(16),
+            n => n,
+        };
         Ok(Banco {
-            cache_wal: Mutex::new(CacheSieve::novo(config.cache_wal)),
+            cache_wal: Mutex::new(CacheSieve::novo(cache_wal)),
             paginador,
             wal,
             estado: Mutex::new(estado),

@@ -7,7 +7,7 @@
 //! Criar e apagar tabela acontecem dentro de uma transação como qualquer outra gravação:
 //! valem (ou não) junto com o resto dela.
 
-use crate::tabela::{Coluna, DefIndice, DefTabela, Tabela};
+use crate::tabela::{Coluna, DefIndice, DefTabela, Padrao, Tabela};
 use crate::valor::{Tipo, Valor, codificar_linha, decodificar_linha};
 use crate::{ErroCatalogo, Resultado};
 use siouxdb_indices::arvore::{self, Cursor};
@@ -74,6 +74,15 @@ fn codificar_def(d: &DefTabela) -> Vec<u8> {
         ]);
         v.extend(i.colunas.iter().map(|&c| Valor::Inteiro(c as i64)));
     }
+    // Extensões: numeração automática e valor padrão de cada coluna.
+    v.push(Valor::Inteiro(d.auto.map_or(-1, |a| a as i64)));
+    for c in &d.colunas {
+        match &c.padrao {
+            Padrao::Nenhum => v.push(Valor::Inteiro(0)),
+            Padrao::Valor(x) => v.extend([Valor::Inteiro(1), x.clone()]),
+            Padrao::Agora => v.push(Valor::Inteiro(2)),
+        }
+    }
     codificar_linha(&v)
 }
 
@@ -103,6 +112,7 @@ fn decodificar_def(b: &[u8]) -> Resultado<DefTabela> {
             nome,
             tipo,
             nao_nulo,
+            padrao: Padrao::Nenhum,
         });
     }
     let k = inteiro(&mut it)? as usize;
@@ -141,6 +151,18 @@ fn decodificar_def(b: &[u8]) -> Resultado<DefTabela> {
             });
         }
     }
+    let mut auto = None;
+    if let Some(Valor::Inteiro(a)) = it.next() {
+        auto = usize::try_from(a).ok().filter(|a| *a < colunas.len());
+        for c in &mut colunas {
+            c.padrao = match it.next() {
+                Some(Valor::Inteiro(0)) => Padrao::Nenhum,
+                Some(Valor::Inteiro(1)) => Padrao::Valor(it.next().ok_or(RUIM)?),
+                Some(Valor::Inteiro(2)) => Padrao::Agora,
+                _ => return Err(RUIM),
+            };
+        }
+    }
     if it.next().is_some() || chave.is_empty() {
         return Err(RUIM);
     }
@@ -151,6 +173,7 @@ fn decodificar_def(b: &[u8]) -> Resultado<DefTabela> {
         chave,
         cabecalho,
         indices,
+        auto,
     })
 }
 
@@ -160,6 +183,36 @@ pub fn criar_tabela<P: PaginasMut + ?Sized>(
     nome: &str,
     colunas: &[Coluna],
     chave: &[&str],
+) -> Resultado<Tabela> {
+    criar_tabela_com(tx, nome, colunas, chave, None)
+}
+
+/// O valor padrão precisa ser do tipo da coluna.
+fn conferir_padrao(c: &Coluna) -> Resultado<()> {
+    let ok = match &c.padrao {
+        Padrao::Nenhum => true,
+        Padrao::Agora => c.tipo == Tipo::DataHora,
+        Padrao::Valor(v) => v.tipo().is_none_or(|t| t == c.tipo),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(ErroCatalogo::DefinicaoInvalida(format!(
+            "o valor padrão da coluna \"{}\" não é {}",
+            c.nome,
+            c.tipo.nome()
+        )))
+    }
+}
+
+/// Como [`criar_tabela`], com uma coluna inteira de numeração automática (`auto`): quando a
+/// gravação não informa o valor, ela recebe o maior já usado mais um.
+pub fn criar_tabela_com<P: PaginasMut + ?Sized>(
+    tx: &mut P,
+    nome: &str,
+    colunas: &[Coluna],
+    chave: &[&str],
+    auto: Option<&str>,
 ) -> Resultado<Tabela> {
     let nome = normalizar_nome(nome)?;
     if nome.starts_with(PREFIXO_SISTEMA) {
@@ -180,12 +233,29 @@ pub fn criar_tabela<P: PaginasMut + ?Sized>(
                 "coluna \"{n}\" repetida"
             )));
         }
+        conferir_padrao(c)?;
         cols.push(Coluna {
             nome: n,
             tipo: c.tipo,
             nao_nulo: c.nao_nulo,
+            padrao: c.padrao.clone(),
         });
     }
+    let auto = match auto {
+        None => None,
+        Some(a) => {
+            let n = normalizar_nome(a)?;
+            let i = cols.iter().position(|c| c.nome == n).ok_or_else(|| {
+                ErroCatalogo::DefinicaoInvalida(format!("a coluna automática \"{n}\" não existe"))
+            })?;
+            if cols[i].tipo != Tipo::Inteiro {
+                return Err(ErroCatalogo::DefinicaoInvalida(format!(
+                    "a coluna automática \"{n}\" precisa ser INTEIRO"
+                )));
+            }
+            Some(i)
+        }
+    };
     if chave.is_empty() {
         return Err(ErroCatalogo::DefinicaoInvalida(
             "a tabela precisa de chave primária".into(),
@@ -228,6 +298,7 @@ pub fn criar_tabela<P: PaginasMut + ?Sized>(
         chave: posicoes,
         cabecalho,
         indices: Vec::new(),
+        auto,
     };
     arvore::inserir(tx, raiz, &k, &codificar_def(&def)).map_err(|e| {
         match ErroCatalogo::from(e) {
@@ -459,4 +530,94 @@ pub fn sys_indices<P: Paginas + ?Sized>(p: &P) -> Resultado<Vec<Vec<Valor>>> {
         }
     }
     Ok(v)
+}
+
+fn regravar_def<P: PaginasMut + ?Sized>(tx: &mut P, def: &DefTabela) -> Resultado<()> {
+    arvore::inserir(
+        tx,
+        tx.meta().raiz_catalogo,
+        &chave_tabela(&def.nome),
+        &codificar_def(def),
+    )
+    .map_err(|e| match ErroCatalogo::from(e) {
+        ErroCatalogo::Indice(siouxdb_indices::ErroIndice::EntradaGrandeDemais { .. }) => {
+            ErroCatalogo::DefinicaoInvalida(
+                "colunas demais (ou nomes longos demais) para este tamanho de página".into(),
+            )
+        }
+        outro => outro,
+    })?;
+    Ok(())
+}
+
+/// Acrescenta uma coluna no fim da tabela. As linhas que já existem passam a mostrar o valor
+/// padrão dela (ou nulo); nada é regravado. Coluna obrigatória precisa de valor padrão fixo.
+pub fn adicionar_coluna<P: PaginasMut + ?Sized>(
+    tx: &mut P,
+    tabela: &str,
+    coluna: &Coluna,
+) -> Resultado<()> {
+    let t = tabela_obrigatoria(tx, tabela)?;
+    let nome = normalizar_nome(&coluna.nome)?;
+    if t.def().colunas.iter().any(|c| c.nome == nome) {
+        return Err(ErroCatalogo::DefinicaoInvalida(format!(
+            "a coluna \"{nome}\" já existe"
+        )));
+    }
+    conferir_padrao(coluna)?;
+    if coluna.nao_nulo && !matches!(&coluna.padrao, Padrao::Valor(v) if !matches!(v, Valor::Nulo)) {
+        return Err(ErroCatalogo::DefinicaoInvalida(format!(
+            "a coluna obrigatória \"{nome}\" precisa de um valor padrão fixo para as linhas que já existem"
+        )));
+    }
+    let mut def = t.def().clone();
+    def.colunas.push(Coluna {
+        nome,
+        tipo: coluna.tipo,
+        nao_nulo: coluna.nao_nulo,
+        padrao: coluna.padrao.clone(),
+    });
+    regravar_def(tx, &def)
+}
+
+/// Troca o nome de uma coluna (só o catálogo muda).
+pub fn renomear_coluna<P: PaginasMut + ?Sized>(
+    tx: &mut P,
+    tabela: &str,
+    de: &str,
+    para: &str,
+) -> Resultado<()> {
+    let t = tabela_obrigatoria(tx, tabela)?;
+    let (de, para) = (normalizar_nome(de)?, normalizar_nome(para)?);
+    let mut def = t.def().clone();
+    if def.colunas.iter().any(|c| c.nome == para) {
+        return Err(ErroCatalogo::DefinicaoInvalida(format!(
+            "a coluna \"{para}\" já existe"
+        )));
+    }
+    let c = def
+        .colunas
+        .iter_mut()
+        .find(|c| c.nome == de)
+        .ok_or_else(|| ErroCatalogo::DefinicaoInvalida(format!("a coluna \"{de}\" não existe")))?;
+    c.nome = para;
+    regravar_def(tx, &def)
+}
+
+/// Troca o nome de uma tabela (só o catálogo muda).
+pub fn renomear_tabela<P: PaginasMut + ?Sized>(tx: &mut P, de: &str, para: &str) -> Resultado<()> {
+    let t = tabela_obrigatoria(tx, de)?;
+    let para = normalizar_nome(para)?;
+    if para.starts_with(PREFIXO_SISTEMA) {
+        return Err(ErroCatalogo::NomeInvalido(format!(
+            "\"{para}\": o prefixo {PREFIXO_SISTEMA} é reservado ao sistema"
+        )));
+    }
+    if tabela(tx, &para)?.is_some() {
+        return Err(ErroCatalogo::TabelaJaExiste(para));
+    }
+    let mut def = t.def().clone();
+    arvore::remover(tx, tx.meta().raiz_catalogo, &chave_tabela(&def.nome))?;
+    def.nome = para;
+    regravar_def(tx, &def)
 }

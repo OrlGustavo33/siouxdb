@@ -23,6 +23,7 @@ mod wal;
 
 pub use banco::{
     Banco, Config, EstatisticasBanco, Leitura, Paginas, PaginasMut, Sincronia, Transacao,
+    cache_automatico_bytes,
 };
 pub use erro::{ErroBanco, Resultado};
 

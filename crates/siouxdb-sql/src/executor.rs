@@ -1,15 +1,17 @@
 //! Planejador simples e execução.
 
 use crate::avaliar::{
-    Ctx, avaliar, conferir_colunas, ordem_total, passa, resolver_agregados, tem_agregado,
-    tem_coluna,
+    Ctx, avaliar, conferir_colunas, decimal_de, ordem_total, passa, resolver_agregados,
+    tem_agregado, tem_coluna,
 };
 use crate::erro::semantica;
-use crate::parser::{Comando, Conflito, Expr, Item, Op, Selecao, analisar};
+use crate::parser::{ColDef, Comando, Conflito, Expr, Item, Op, Selecao, analisar};
 use crate::{Resultado, Saida};
-use siouxdb_catalogo::catalogo::{self, criar_tabela};
+use siouxdb_catalogo::catalogo;
 use siouxdb_catalogo::valor::codificar_chave;
-use siouxdb_catalogo::{Coluna, ErroCatalogo, Tabela, Tipo, Valor, fim_do_prefixo};
+use siouxdb_catalogo::{
+    Coluna, Decimal, ErroCatalogo, Padrao, Tabela, Tipo, Valor, datahora, fim_do_prefixo,
+};
 use siouxdb_transacoes::{Paginas, PaginasMut};
 
 /// Como as linhas da tabela vão ser lidas.
@@ -64,6 +66,10 @@ fn constante(e: &Expr, params: &[Valor]) -> Option<Valor> {
 fn no_tipo(v: Valor, tipo: Tipo) -> Option<Valor> {
     match (v, tipo) {
         (Valor::Inteiro(i), Tipo::Real) => Some(Valor::Real(i as f64)),
+        (v @ (Valor::Inteiro(_) | Valor::Real(_)), Tipo::Decimal) => {
+            decimal_de(&v).map(Valor::Decimal)
+        }
+        (Valor::Texto(t), Tipo::DataHora) => datahora::de_texto(&t).map(Valor::DataHora),
         (v, t) if v.tipo() == Some(t) => Some(v),
         _ => None,
     }
@@ -470,15 +476,65 @@ fn selecionar<P: Paginas + ?Sized>(
             colunas,
             linhas,
             afetadas: 0,
+            ultimo_id: None,
         },
         plano,
     ))
+}
+
+/// Coluna do catálogo a partir da definição do SQL (avalia o DEFAULT).
+fn coluna_de(c: &ColDef, params: &[Valor]) -> Resultado<Coluna> {
+    let mut col = Coluna {
+        nome: c.nome.clone(),
+        tipo: c.tipo,
+        nao_nulo: c.nao_nulo,
+        padrao: Padrao::Nenhum,
+    };
+    col.padrao = match &c.padrao {
+        None => Padrao::Nenhum,
+        Some(Expr::Funcao(f, args, _)) if args.is_empty() && (f == "agora" || f == "now") => {
+            Padrao::Agora
+        }
+        Some(e) => match constante(e, params) {
+            Some(v) => Padrao::Valor(coagir(v, &col)?),
+            None => {
+                return semantica(format!(
+                    "o DEFAULT da coluna \"{}\" precisa ser um valor fixo ou AGORA()",
+                    c.nome
+                ));
+            }
+        },
+    };
+    Ok(col)
 }
 
 fn coagir(v: Valor, c: &Coluna) -> Resultado<Valor> {
     match (v, c.tipo) {
         (Valor::Nulo, _) => Ok(Valor::Nulo),
         (Valor::Inteiro(i), Tipo::Real) => Ok(Valor::Real(i as f64)),
+        (Valor::Decimal(d), Tipo::Real) => Ok(Valor::Real(d.para_real())),
+        (v @ (Valor::Inteiro(_) | Valor::Real(_)), Tipo::Decimal) => match decimal_de(&v) {
+            Some(d) => Ok(Valor::Decimal(d)),
+            None => semantica(format!(
+                "valor fora do limite do DECIMAL na coluna \"{}\"",
+                c.nome
+            )),
+        },
+        // Texto para decimal ou data: útil para quem manda JSON e quer o valor exato.
+        (Valor::Texto(t), Tipo::Decimal) => match Decimal::de_texto(&t) {
+            Some(d) => Ok(Valor::Decimal(d)),
+            None => semantica(format!(
+                "\"{t}\" não é um número decimal (coluna \"{}\")",
+                c.nome
+            )),
+        },
+        (Valor::Texto(t), Tipo::DataHora) => match datahora::de_texto(&t) {
+            Some(d) => Ok(Valor::DataHora(d)),
+            None => semantica(format!(
+                "\"{t}\" não é uma data (coluna \"{}\"; use AAAA-MM-DD ou AAAA-MM-DD HH:MM:SS)",
+                c.nome
+            )),
+        },
         (v, t) if v.tipo() == Some(t) => Ok(v),
         (v, t) => semantica(format!(
             "a coluna \"{}\" é {} e recebeu {}",
@@ -541,6 +597,7 @@ pub(crate) fn executar_comando<P: PaginasMut + ?Sized>(
         colunas: Vec::new(),
         linhas: Vec::new(),
         afetadas: n,
+        ultimo_id: None,
     };
     match c {
         Comando::Selecionar(s) => Ok(selecionar(tx, s, params)?.0),
@@ -550,6 +607,7 @@ pub(crate) fn executar_comando<P: PaginasMut + ?Sized>(
                 colunas: vec!["plano".into()],
                 linhas: vec![vec![Valor::Texto(plano)]],
                 afetadas: 0,
+                ultimo_id: None,
             })
         }
         Comando::CriarTabela {
@@ -563,14 +621,33 @@ pub(crate) fn executar_comando<P: PaginasMut + ?Sized>(
             }
             let cols: Vec<Coluna> = colunas
                 .iter()
-                .map(|(n, t, nn)| Coluna {
-                    nome: n.clone(),
-                    tipo: *t,
-                    nao_nulo: *nn,
-                })
+                .map(|c| coluna_de(c, params))
+                .collect::<Resultado<_>>()?;
+            let autos: Vec<&str> = colunas
+                .iter()
+                .filter(|c| c.auto)
+                .map(|c| c.nome.as_str())
                 .collect();
+            if autos.len() > 1 {
+                return semantica("só uma coluna pode ser de numeração automática");
+            }
             let chave: Vec<&str> = chave.iter().map(String::as_str).collect();
-            criar_tabela(tx, nome, &cols, &chave)?;
+            catalogo::criar_tabela_com(tx, nome, &cols, &chave, autos.first().copied())?;
+            Ok(afetadas(0))
+        }
+        Comando::AdicionarColuna { tabela, coluna } => {
+            sistema(tabela)?;
+            catalogo::adicionar_coluna(tx, tabela, &coluna_de(coluna, params)?)?;
+            Ok(afetadas(0))
+        }
+        Comando::RenomearTabela { de, para } => {
+            sistema(de)?;
+            catalogo::renomear_tabela(tx, de, para)?;
+            Ok(afetadas(0))
+        }
+        Comando::RenomearColuna { tabela, de, para } => {
+            sistema(tabela)?;
+            catalogo::renomear_coluna(tx, tabela, de, para)?;
             Ok(afetadas(0))
         }
         Comando::ApagarTabela { nome, se_existe } => {
@@ -623,6 +700,7 @@ pub(crate) fn executar_comando<P: PaginasMut + ?Sized>(
                     .collect::<Resultado<_>>()?,
             };
             let mut n = 0;
+            let mut ultimo_id = None;
             for exprs in linhas {
                 if exprs.len() != posicoes.len() {
                     return semantica(format!(
@@ -631,7 +709,7 @@ pub(crate) fn executar_comando<P: PaginasMut + ?Sized>(
                         exprs.len()
                     ));
                 }
-                let mut linha = vec![Valor::Nulo; d.colunas.len()];
+                let mut parcial: Vec<Option<Valor>> = vec![None; d.colunas.len()];
                 for (e, &pos) in exprs.iter().zip(&posicoes) {
                     let v = avaliar(
                         e,
@@ -641,7 +719,11 @@ pub(crate) fn executar_comando<P: PaginasMut + ?Sized>(
                             params,
                         },
                     )?;
-                    linha[pos] = coagir(v, &d.colunas[pos])?;
+                    parcial[pos] = Some(coagir(v, &d.colunas[pos])?);
+                }
+                let linha = t.preencher(tx, parcial)?;
+                if let Some(Valor::Inteiro(id)) = d.auto.map(|a| &linha[a]) {
+                    ultimo_id = Some(*id);
                 }
                 match conflito {
                     Conflito::Erro => {
@@ -659,7 +741,10 @@ pub(crate) fn executar_comando<P: PaginasMut + ?Sized>(
                     },
                 }
             }
-            Ok(afetadas(n))
+            Ok(Saida {
+                ultimo_id,
+                ..afetadas(n)
+            })
         }
         Comando::Atualizar {
             tabela,
@@ -734,6 +819,7 @@ pub(crate) fn consultar_comando<P: Paginas + ?Sized>(
                 colunas: vec!["plano".into()],
                 linhas: vec![vec![Valor::Texto(plano)]],
                 afetadas: 0,
+                ultimo_id: None,
             })
         }
         _ => semantica("só SELECT numa leitura; para gravar use uma transação"),

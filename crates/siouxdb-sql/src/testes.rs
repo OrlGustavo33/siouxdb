@@ -388,7 +388,8 @@ impl Sorteio {
     }
 }
 
-type Linha = (i64, i64, Option<String>, Option<f64>);
+/// (a, b, c, x, m em quartos: m = quartos / 4)
+type Linha = (i64, i64, Option<String>, Option<f64>, Option<i64>);
 type Teste = Box<dyn Fn(&Linha) -> bool>;
 
 /// Consultas aleatórias pelo planejador x o mesmo filtro calculado em Rust.
@@ -397,16 +398,16 @@ fn diferencial_planejador_contra_filtro_em_rust() {
     let (_vfs, b) = banco();
     exec(
         &b,
-        "CREATE TABLE d (a INT, b INT, c TEXT, x REAL, PRIMARY KEY (a, b))",
+        "CREATE TABLE d (a INT, b INT, c TEXT, x REAL, m DECIMAL, PRIMARY KEY (a, b))",
         &[],
     );
     exec(
         &b,
-        "CREATE INDEX d_c ON d (c); CREATE INDEX d_xa ON d (x, a)",
+        "CREATE INDEX d_c ON d (c); CREATE INDEX d_xa ON d (x, a); CREATE INDEX d_m ON d (m)",
         &[],
     );
     let mut s = Sorteio(99);
-    let mut dados: Vec<(i64, i64, Option<String>, Option<f64>)> = Vec::new();
+    let mut dados: Vec<Linha> = Vec::new();
     let mut tx = b.escrever().unwrap();
     for a in -5..15i64 {
         for bb in 0..12i64 {
@@ -416,18 +417,21 @@ fn diferencial_planejador_contra_filtro_em_rust() {
             let c = (s.ate(6) != 0)
                 .then(|| ["", "a", "b", "ab", "b\0", "z"][s.ate(6) as usize].to_string());
             let x = (s.ate(5) != 0).then(|| s.ate(7) as f64 - 3.0);
+            let m = (s.ate(5) != 0).then(|| s.ate(17) as i64 - 8);
             executar(
                 &mut tx,
-                "INSERT INTO d VALUES (?, ?, ?, ?)",
+                "INSERT INTO d VALUES (?, ?, ?, ?, ?)",
                 &[
                     v(a),
                     v(bb),
                     c.clone().map_or(Valor::Nulo, Valor::Texto),
                     x.map_or(Valor::Nulo, Valor::Real),
+                    // decimal mandado como texto: "-1.75", "0.25"...
+                    m.map_or(Valor::Nulo, |q| Valor::Texto(format!("{}", q as f64 / 4.0))),
                 ],
             )
             .unwrap();
-            dados.push((a, bb, c, x));
+            dados.push((a, bb, c, x, m));
         }
     }
     tx.confirmar().unwrap();
@@ -446,7 +450,7 @@ fn diferencial_planejador_contra_filtro_em_rust() {
                 ">" => o.is_gt(),
                 _ => o.is_ge(),
             };
-            match s.ate(4) {
+            match s.ate(5) {
                 0 => {
                     let k = s.ate(24) as i64 - 7;
                     conds.push(format!("a {op} {k}"));
@@ -465,7 +469,7 @@ fn diferencial_planejador_contra_filtro_em_rust() {
                             .is_some_and(|c| cmp(c.as_bytes().cmp(k.as_bytes())))
                     }));
                 }
-                _ => {
+                3 => {
                     let k = s.ate(9) as i64 - 4;
                     // às vezes como inteiro, às vezes como real
                     let lit = if s.ate(2) == 0 {
@@ -478,6 +482,18 @@ fn diferencial_planejador_contra_filtro_em_rust() {
                         r.3.is_some_and(|x| cmp(x.total_cmp(&(k as f64))))
                     }));
                 }
+                4 => {
+                    // decimal comparado com literal inteiro ou com casas ("0.75")
+                    let q = s.ate(21) as i64 - 10;
+                    let lit = if q % 4 == 0 && s.ate(2) == 0 {
+                        format!("{}", q / 4)
+                    } else {
+                        format!("{:?}", q as f64 / 4.0)
+                    };
+                    conds.push(format!("m {op} {lit}"));
+                    testes.push(Box::new(move |r| r.4.is_some_and(|m| cmp(m.cmp(&q)))));
+                }
+                _ => unreachable!(),
             }
         }
         let onde = conds.join(" AND ");
@@ -504,8 +520,564 @@ fn diferencial_planejador_contra_filtro_em_rust() {
         "faixa da chave primária",
         "índice d_c",
         "índice d_xa",
+        "índice d_m",
         "varredura completa",
     ] {
         assert!(planos.contains(p), "plano não exercitado: {p} ({planos:?})");
+    }
+}
+
+#[test]
+fn decimal_data_padrao_auto_e_alter() {
+    let (_vfs, b) = banco();
+    exec(
+        &b,
+        "CREATE TABLE vendas (
+            id SERIAL PRIMARY KEY,
+            total DECIMAL NOT NULL,
+            quando DATAHORA DEFAULT AGORA(),
+            status TEXTO NOT NULL DEFAULT 'aberta',
+            obs TEXTO)",
+        &[],
+    );
+    // Numeração automática: omitida, NULL e explícita.
+    let r = exec(&b, "INSERT INTO vendas (total) VALUES (0.1), (0.2)", &[]);
+    assert_eq!((r[0].afetadas, r[0].ultimo_id), (2, Some(2)));
+    let r = exec(
+        &b,
+        "INSERT INTO vendas (id, total, quando) VALUES (100, '19.99', '2026-11-23 10:00:00')",
+        &[],
+    );
+    assert_eq!(r[0].ultimo_id, Some(100));
+    let r = exec(
+        &b,
+        "INSERT INTO vendas (id, total, status) VALUES (NULL, 5, 'paga')",
+        &[],
+    );
+    assert_eq!(r[0].ultimo_id, Some(101));
+    assert_eq!(
+        q(&b, "SELECT id, status FROM vendas ORDER BY id", &[])
+            .iter()
+            .map(|l| l[0].clone())
+            .collect::<Vec<_>>(),
+        vec![v(1), v(2), v(100), v(101)]
+    );
+    assert_eq!(
+        q(&b, "SELECT status FROM vendas WHERE id = 1", &[]),
+        vec![vec![v("aberta")]]
+    );
+    // O padrão AGORA() preencheu a data.
+    assert_eq!(
+        q(
+            &b,
+            "SELECT COUNT(*) FROM vendas WHERE quando > '2026-01-01'",
+            &[]
+        ),
+        vec![vec![v(4)]]
+    );
+
+    // Decimal é exato onde o ponto flutuante erra.
+    let dec = |s: &str| Valor::Decimal(siouxdb_catalogo::Decimal::de_texto(s).unwrap());
+    assert_eq!(
+        q(&b, "SELECT SUM(total) FROM vendas WHERE id <= 2", &[]),
+        vec![vec![dec("0.3")]]
+    );
+    // A conta em REAL (0.3 - 0.1 = 0.19999999999999998) é arredondada ao comparar com decimal.
+    assert_eq!(
+        q(&b, "SELECT id FROM vendas WHERE total = 0.3 - 0.1", &[]),
+        vec![vec![v(2)]]
+    );
+    assert_eq!(
+        q(&b, "SELECT id FROM vendas WHERE total = 0.2", &[]),
+        vec![vec![v(2)]]
+    );
+    assert_eq!(
+        q(
+            &b,
+            "SELECT total * 3, total / 3, total + 1, -total FROM vendas WHERE id = 100",
+            &[]
+        ),
+        vec![vec![
+            dec("59.97"),
+            dec("6.6633333333"),
+            dec("20.99"),
+            dec("-19.99")
+        ]]
+    );
+    assert_eq!(
+        q(
+            &b,
+            "SELECT AVG(total), MAX(total), MIN(total) FROM vendas",
+            &[]
+        ),
+        vec![vec![dec("6.3225"), dec("19.99"), dec("0.1")]]
+    );
+    assert_eq!(
+        q(
+            &b,
+            "SELECT id FROM vendas WHERE total > 1 ORDER BY total DESC",
+            &[]
+        ),
+        vec![vec![v(100)], vec![v(101)]]
+    );
+    exec(&b, "CREATE INDEX vendas_total ON vendas (total)", &[]);
+    assert_eq!(
+        plano(&b, "SELECT * FROM vendas WHERE total >= 5", &[]),
+        "índice vendas_total"
+    );
+    assert_eq!(
+        q(
+            &b,
+            "SELECT id FROM vendas WHERE total >= 5 AND total < 19.99",
+            &[]
+        ),
+        vec![vec![v(101)]]
+    );
+    exec(
+        &b,
+        "UPDATE vendas SET total = total * 1.1 WHERE id = 101",
+        &[],
+    );
+    assert_eq!(
+        q(&b, "SELECT total FROM vendas WHERE id = 101", &[]),
+        vec![vec![dec("5.5")]]
+    );
+
+    // Datas: comparação, faixa, ordenação e texto inválido.
+    exec(
+        &b,
+        "UPDATE vendas SET quando = '2020-05-01' WHERE id IN (2, 101)",
+        &[],
+    );
+    exec(
+        &b,
+        "UPDATE vendas SET quando = '2026-11-22T23:30:00-03:00' WHERE id = 1",
+        &[],
+    );
+    assert_eq!(
+        q(
+            &b,
+            "SELECT id FROM vendas WHERE quando >= '2026-11-23' AND quando < '2026-11-24' ORDER BY quando",
+            &[]
+        ),
+        vec![vec![v(1)], vec![v(100)]]
+    );
+    assert_eq!(
+        q(&b, "SELECT quando FROM vendas WHERE id = 100", &[]),
+        vec![vec![Valor::DataHora(1_795_428_000_000_000)]]
+    );
+    assert!(
+        erro(
+            &b,
+            "INSERT INTO vendas (total, quando) VALUES (1, '23/11/2026')"
+        )
+        .to_string()
+        .contains("não é uma data")
+    );
+    assert!(
+        erro(&b, "INSERT INTO vendas (total) VALUES ('abc')")
+            .to_string()
+            .contains("decimal")
+    );
+    assert!(
+        erro(&b, "INSERT INTO vendas (obs) VALUES ('sem total')")
+            .to_string()
+            .contains("não aceita nulo")
+    );
+
+    // ALTER TABLE: coluna nova com padrão aparece nas linhas antigas, sem regravar nada.
+    let lsn_antes = b.estatisticas().lsn_escrito;
+    exec(
+        &b,
+        "ALTER TABLE vendas ADD COLUMN desconto DECIMAL NOT NULL DEFAULT 0; ALTER TABLE vendas ADD cupom TEXTO",
+        &[],
+    );
+    assert_eq!(
+        q(&b, "SELECT desconto, cupom FROM vendas WHERE id = 1", &[]),
+        vec![vec![dec("0"), Valor::Nulo]]
+    );
+    exec(
+        &b,
+        "UPDATE vendas SET desconto = 1.5, cupom = 'X' WHERE id = 2",
+        &[],
+    );
+    assert_eq!(
+        q(&b, "SELECT SUM(desconto), COUNT(cupom) FROM vendas", &[]),
+        vec![vec![dec("1.5"), v(1)]]
+    );
+    exec(
+        &b,
+        "INSERT INTO vendas (total, desconto) VALUES (7, 0.5)",
+        &[],
+    );
+    assert_eq!(
+        q(
+            &b,
+            &format!("SELECT desconto FROM vendas AS OF {lsn_antes} WHERE id = 2"),
+            &[]
+        ),
+        vec![vec![dec("0")]]
+    );
+    assert!(
+        erro(&b, "ALTER TABLE vendas ADD COLUMN x TEXTO NOT NULL")
+            .to_string()
+            .contains("valor padrão")
+    );
+    assert!(
+        erro(&b, "ALTER TABLE vendas ADD COLUMN total INT")
+            .to_string()
+            .contains("já existe")
+    );
+    assert!(
+        erro(&b, "ALTER TABLE vendas ADD COLUMN d DATAHORA DEFAULT 5")
+            .to_string()
+            .contains("DATAHORA")
+    );
+    // Renomear coluna e tabela: índice e dados continuam.
+    exec(
+        &b,
+        "ALTER TABLE vendas RENAME COLUMN total TO valor; ALTER TABLE vendas RENAME TO pedidos",
+        &[],
+    );
+    assert_eq!(
+        plano(&b, "SELECT * FROM pedidos WHERE valor = 7", &[]),
+        "índice vendas_total"
+    );
+    assert_eq!(
+        q(&b, "SELECT id FROM pedidos WHERE valor = 7", &[]),
+        vec![vec![v(102)]]
+    );
+    assert!(
+        erro(&b, "SELECT * FROM vendas")
+            .to_string()
+            .contains("não existe")
+    );
+    assert_eq!(
+        q(
+            &b,
+            "SELECT tipo FROM sys_colunas WHERE tabela = 'pedidos' AND nome IN ('valor', 'quando') ORDER BY nome",
+            &[]
+        ),
+        vec![vec![v("DATAHORA")], vec![v("DECIMAL")]]
+    );
+}
+
+fn fator_simulacao() -> u64 {
+    std::env::var("SIOUX_SIM_FATOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Texto SQL aleatório (pedaços válidos misturados com lixo) nunca derruba o analisador.
+#[test]
+fn sql_aleatorio_nunca_causa_panico() {
+    let pedacos = [
+        "SELECT",
+        "FROM",
+        "WHERE",
+        "INSERT",
+        "INTO",
+        "VALUES",
+        "UPDATE",
+        "SET",
+        "DELETE",
+        "CREATE",
+        "TABLE",
+        "INDEX",
+        "ALTER",
+        "ADD",
+        "COLUMN",
+        "DROP",
+        "PRIMARY",
+        "KEY",
+        "NOT",
+        "NULL",
+        "AND",
+        "OR",
+        "IN",
+        "BETWEEN",
+        "LIKE",
+        "IS",
+        "GROUP",
+        "BY",
+        "ORDER",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "AS",
+        "OF",
+        "DEFAULT",
+        "UNIQUE",
+        "ON",
+        "CONFLICT",
+        "DO",
+        "t",
+        "id",
+        "nome",
+        "COUNT",
+        "SUM",
+        "(",
+        ")",
+        ",",
+        ";",
+        "*",
+        "=",
+        "<",
+        ">",
+        "<=",
+        ">=",
+        "<>",
+        "||",
+        "+",
+        "-",
+        "/",
+        "%",
+        ".",
+        "?",
+        "$1",
+        "$0",
+        "$",
+        "1",
+        "0.5",
+        "1e999",
+        "99999999999999999999",
+        "'texto'",
+        "'aberto",
+        "\"x\"",
+        "\"",
+        "--",
+        "/*",
+        "*/",
+        "\n",
+        "ã",
+        "\u{0}",
+        "INTEIRO",
+        "DECIMAL",
+        "DATAHORA",
+        "SERIAL",
+        "AGORA",
+        "EXPLAIN",
+    ];
+    let mut s = Sorteio(2026);
+    let (_vfs, b) = banco();
+    exec(&b, "CREATE TABLE t (id INT PRIMARY KEY, nome TEXT)", &[]);
+    for _ in 0..20_000 * fator_simulacao() {
+        let n = 1 + s.ate(14);
+        let sql: String = (0..n)
+            .map(|_| pedacos[s.ate(pedacos.len() as u64) as usize])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = somente_leitura(&sql);
+        // Os que passam no analisador também rodam (numa transação desfeita).
+        let mut tx = b.escrever().unwrap();
+        let _ = executar(&mut tx, &sql, &[v(1)]);
+        tx.desfazer();
+    }
+}
+
+/// Estraga páginas do arquivo **mantendo a verificação válida** (como faria um defeito do
+/// próprio programa) e usa o banco de todas as formas: o resultado pode ser erro, nunca
+/// pânico nem laço sem fim.
+#[test]
+fn pagina_estragada_com_verificacao_valida_nunca_causa_panico() {
+    use siouxdb_armazenamento::crc32c;
+    use siouxdb_vfs::{Arquivo, ModoAbertura};
+    let caminho = PathBuf::from("b.sdb");
+    let preparar = |vfs: &VfsSimulado| {
+        let b = B::criar(vfs, &caminho, TamanhoPagina::K4, None, Config::default()).unwrap();
+        exec(
+            &b,
+            "CREATE TABLE a (id SERIAL PRIMARY KEY, nome TEXT, valor DECIMAL, quando DATAHORA DEFAULT AGORA());
+             CREATE INDEX a_nome ON a (nome); CREATE TABLE z (k TEXT PRIMARY KEY, doc TEXT)",
+            &[],
+        );
+        let mut tx = b.escrever().unwrap();
+        for i in 0..400 {
+            executar(
+                &mut tx,
+                "INSERT INTO a (nome, valor) VALUES (?, ?)",
+                &[v(format!("nome {}", i % 37)), v(i)],
+            )
+            .unwrap();
+        }
+        executar(
+            &mut tx,
+            "INSERT INTO z VALUES ('grande', ?), ('pequeno', 'x')",
+            &[v("g".repeat(20_000))],
+        )
+        .unwrap();
+        executar(
+            &mut tx,
+            "UPDATE a SET valor = valor + 1 WHERE id < 50; DELETE FROM a WHERE id > 390",
+            &[],
+        )
+        .unwrap();
+        tx.confirmar().unwrap();
+        b.checkpoint().unwrap();
+    };
+    let usar = |vfs: &VfsSimulado| {
+        let Ok(b) = B::abrir(vfs, &caminho, None, Config::default()) else {
+            return;
+        };
+        for sql in [
+            "SELECT * FROM sys_tabelas",
+            "SELECT * FROM sys_colunas",
+            "SELECT * FROM sys_indices",
+            "SELECT COUNT(*), SUM(valor), MAX(nome) FROM a",
+            "SELECT * FROM a WHERE nome = 'nome 5'",
+            "SELECT * FROM a WHERE id BETWEEN 10 AND 20",
+            "SELECT * FROM a AS OF 1",
+            "SELECT k, doc FROM z",
+        ] {
+            if let Ok(l) = b.ler() {
+                let _ = consultar(&l, sql, &[]);
+            }
+        }
+        if let Ok(l) = b.ler() {
+            if let Ok(tabelas) = siouxdb_catalogo::catalogo::tabelas(&l) {
+                for t in tabelas {
+                    let _ = t.verificar_indice(&l);
+                    let _ = t.historico(&l, &[v(5)]);
+                }
+            }
+        }
+        for sql in [
+            "INSERT INTO a (nome, valor) VALUES ('novo', 1)",
+            "UPDATE a SET nome = 'x' WHERE id = 7",
+            "DELETE FROM a WHERE id = 8",
+            "INSERT INTO z VALUES ('outro', 'y')",
+            "CREATE TABLE nova (id INT PRIMARY KEY)",
+            "DROP TABLE z",
+            "ALTER TABLE a ADD COLUMN extra INT DEFAULT 0",
+        ] {
+            if let Ok(mut tx) = b.escrever() {
+                if executar(&mut tx, sql, &[]).is_ok() {
+                    let _ = tx.confirmar();
+                }
+            }
+        }
+        if let Ok(mut tx) = b.escrever() {
+            if let Ok(Some(t)) = siouxdb_catalogo::catalogo::tabela(&tx, "a") {
+                if t.compactar(&mut tx, u64::MAX).is_ok() {
+                    let _ = tx.confirmar();
+                }
+            }
+        }
+        let _ = b.checkpoint();
+    };
+    let mut s = Sorteio(77);
+    for rodada in 0..400 * fator_simulacao() {
+        let vfs = VfsSimulado::novo(ConfigSimulacao::default());
+        preparar(&vfs);
+        let arq = vfs.abrir(&caminho, ModoAbertura::LeituraGravacao).unwrap();
+        let paginas = arq.tamanho().unwrap() / 4096;
+        // Estraga de 1 a 3 páginas: bytes aleatórios, zeros, ou um campo trocado por um extremo.
+        for _ in 0..1 + s.ate(3) {
+            let n = 2 + s.ate(paginas - 2);
+            let mut pg = vec![0u8; 4096];
+            arq.ler_exato_em(n * 4096, &mut pg).unwrap();
+            match s.ate(4) {
+                0 => {
+                    for _ in 0..1 + s.ate(8) {
+                        let i = 24 + s.ate(4072) as usize;
+                        pg[i] = s.ate(256) as u8;
+                    }
+                }
+                1 => {
+                    let i = 24 + s.ate(200) as usize;
+                    let extremos = [
+                        0u64,
+                        1,
+                        2,
+                        u64::MAX,
+                        u32::MAX as u64,
+                        n,
+                        paginas,
+                        paginas + 1,
+                        0xFFFF,
+                    ];
+                    let v = extremos[s.ate(9) as usize].to_le_bytes();
+                    let tam = [1usize, 2, 4, 8][s.ate(4) as usize];
+                    pg[i..i + tam].copy_from_slice(&v[..tam]);
+                }
+                2 => pg[24..24 + 64].fill(0xFF),
+                _ => pg[4] = s.ate(9) as u8,
+            }
+            let crc = crc32c(&pg[4..]);
+            pg[..4].copy_from_slice(&crc.to_le_bytes());
+            arq.gravar_em(n * 4096, &pg).unwrap();
+        }
+        arq.sincronizar().unwrap();
+        drop(arq);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| usar(&vfs)));
+        assert!(r.is_ok(), "pânico na rodada {rodada}");
+    }
+}
+
+/// WAL cortado ou com bytes trocados: abrir dá certo (recupera o que estava inteiro) ou dá
+/// erro; o que abre continua utilizável.
+#[test]
+fn wal_estragado_nunca_causa_panico() {
+    use siouxdb_vfs::{Arquivo, ModoAbertura};
+    let caminho = PathBuf::from("b.sdb");
+    let mut s = Sorteio(5);
+    for rodada in 0..300 * fator_simulacao() {
+        let vfs = VfsSimulado::novo(ConfigSimulacao::default());
+        let b = B::criar(
+            &vfs,
+            &caminho,
+            TamanhoPagina::K4,
+            None,
+            Config {
+                checkpoint_apos_paginas: 0,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        exec(&b, "CREATE TABLE t (id INT PRIMARY KEY, n TEXT)", &[]);
+        for i in 0..6 {
+            exec(
+                &b,
+                "INSERT INTO t VALUES (?, ?)",
+                &[v(i), v(format!("linha {i}"))],
+            );
+        }
+        drop(b);
+        let wal = vfs
+            .abrir(&PathBuf::from("b.sdb-wal"), ModoAbertura::LeituraGravacao)
+            .unwrap();
+        let tam = wal.tamanho().unwrap();
+        match s.ate(3) {
+            0 => wal.truncar(s.ate(tam)).unwrap(),
+            1 => {
+                for _ in 0..1 + s.ate(4) {
+                    wal.gravar_em(s.ate(tam), &[s.ate(256) as u8]).unwrap();
+                }
+            }
+            _ => wal
+                .gravar_em(s.ate(tam), &vec![0u8; 1 + s.ate(5000) as usize])
+                .unwrap(),
+        }
+        wal.sincronizar().unwrap();
+        drop(wal);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Ok(b) = B::abrir(&vfs, &caminho, None, Config::default()) {
+                // O que foi recuperado é um prefixo inteiro das confirmações.
+                let n = match consultar(&b.ler().unwrap(), "SELECT COUNT(*) FROM sys_tabelas", &[])
+                {
+                    Ok(r) => r.linhas[0][0].clone(),
+                    Err(e) => panic!("catálogo ilegível depois de recuperar: {e}"),
+                };
+                if n == v(1) {
+                    let linhas = q(&b, "SELECT id FROM t ORDER BY id", &[]);
+                    let esperado: Vec<Vec<Valor>> =
+                        (0..linhas.len() as i64).map(|i| vec![v(i)]).collect();
+                    assert_eq!(linhas, esperado, "recuperou confirmações fora de ordem");
+                    exec(&b, "INSERT INTO t VALUES (100, 'depois')", &[]);
+                }
+            }
+        }));
+        assert!(r.is_ok(), "pânico na rodada {rodada}");
     }
 }

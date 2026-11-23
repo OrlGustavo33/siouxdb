@@ -40,6 +40,8 @@ pub struct Saida {
     pub linhas: Vec<Vec<Valor>>,
     /// Linhas inseridas, alteradas ou removidas.
     pub afetadas: u64,
+    /// Num INSERT em tabela com numeração automática: o último número usado.
+    pub ultimo_id: Option<i64>,
 }
 
 /// Todos os comandos do texto só leem? (Para escolher entre leitura e transação.)

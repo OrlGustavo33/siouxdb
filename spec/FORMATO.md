@@ -1,6 +1,6 @@
-# Formato do arquivo — rascunho v0
+# Formato do arquivo — versão 1
 
-> **Instável.** Enquanto `VERSAO_FORMATO = 0`, o formato pode mudar sem compatibilidade. A partir da 1.0, toda versão 1.x abre arquivos 1.0.
+> **Congelado em 23/11/2026.** O que está descrito aqui é a versão 1 do formato (arquivo principal e WAL). Mudanças futuras só acrescentam (campos reservados, tipos de página e de valor novos) ou sobem o número da versão — e o programa continua abrindo a versão 1. Os arquivos de `spec/exemplos/` foram gravados por esta versão e são abertos e conferidos em todo CI (`crates/siouxdb/tests/formato.rs`).
 
 ## Arquivos
 - `banco.sdb` — arquivo principal.
@@ -16,7 +16,7 @@ Cópia A no byte 0 (página 0), cópia B no byte `tamanho_da_página` (página 1
 | Bytes | Campo |
 |---|---|
 | 0..8 | assinatura `SIOUXDB\0` |
-| 8..12 | versão do formato (hoje 0) |
+| 8..12 | versão do formato (1) |
 | 12..16 | tamanho da página em bytes |
 | 16..24 | geração |
 | 24..32 | total de páginas (inclui as 2 reservadas) |
@@ -85,7 +85,7 @@ O banco são dois arquivos: `banco.sdb` (principal) e `banco.sdb-wal` (registro 
 | Bytes | Campo |
 |---|---|
 | 0..8 | `SIOUXWAL` |
-| 8..12 | versão do WAL (0) |
+| 8..12 | versão do WAL (1) |
 | 12..16 | tamanho da página |
 | 16..32 | identificador do arquivo principal (bytes 168..184 do cabeçalho dele) — WAL de outro banco é ignorado |
 | 32..40 | sal (sorteado a cada reinício do WAL) |
@@ -128,7 +128,9 @@ A raiz nunca muda de página. Chaves são comparadas como bytes; a separadora qu
 
 ### Chaves e linhas
 - **Chave** (ordenável como bytes): por coluna, um byte de tipo (0 nulo, 1 booleano, 2 inteiro, 3 real, 4 texto, 5 bytes) e o valor — inteiro em big-endian com o bit de sinal invertido; real com o truque de bits do IEEE 754; texto e bytes com `00` → `00 FF` e terminador `00 00`.
-- **Linha**: quantidade u16 e, por valor, um byte de tipo e o valor em little-endian (texto/bytes com tamanho u32).
+- **Linha**: quantidade u16 e, por valor, um byte de tipo (0 nulo, 1 inteiro, 2 real, 3 texto, 4 bytes, 5 booleano, 6 decimal, 7 data/hora) e o valor em little-endian (texto/bytes com tamanho u32). Uma linha pode ter **menos** valores que a tabela tem colunas (foi gravada antes de um `ALTER TABLE ADD COLUMN`): as que faltam valem o padrão da coluna.
+- **Decimal**: inteiro de 128 bits = valor × 10¹⁰ (ponto fixo, 10 casas). Na chave: tipo 6 + 16 bytes big-endian com o bit de sinal invertido.
+- **Data/hora**: inteiro de 64 bits, microssegundos desde 1970-01-01 UTC. Na chave: tipo 7 + 8 bytes big-endian com o bit de sinal invertido.
 
 ### Log quente (livro-razão das versões)
 Página: `0..8` próxima página · `8..10` bytes usados · registros a partir do byte 16. Registro: tamanho u16 · marcas (bit 0 = remoção) · tamanho da chave u16 · versão anterior da mesma chave (ponteiro = página << 16 | posição) · LSN · instante (µs) · chave · linha. Nada é sobrescrito: cada gravação anexa uma versão.
@@ -143,9 +145,9 @@ Reescreve o log de uma tabela guardando, por chave, as versões posteriores ao L
 Árvore B+ por índice; chave = valores das colunas indexadas (codificação de chave) + chave primária codificada; valor = chave primária codificada. Guarda só o estado atual (não é versionado): consultas `AS OF` usam a tabela. A lista de índices (nome, único, raiz, colunas) fica na definição da tabela no catálogo.
 
 ### Tabela e catálogo
-- Cabeçalho de tabela: raiz do índice, primeira e última página do log, versões, linhas (5 × u64).
+- Cabeçalho de tabela: raiz do índice, primeira e última página do log, versões, linhas, último número da numeração automática (6 × u64).
 - O índice da chave primária leva à versão mais nova; remoção também é versão (o histórico continua alcançável).
-- Catálogo: árvore B+ na `raiz_catalogo` do cabeçalho do banco — `00 "proximo_id"` → contador; `01 + nome` → definição (id, nome, cabeçalho, colunas com tipo e não-nulo, posições da chave). `sys_tabelas` e `sys_colunas` são visões calculadas.
+- Catálogo: árvore B+ na `raiz_catalogo` do cabeçalho do banco — `00 "proximo_id"` → contador; `01 + nome` → definição, codificada como uma linha: id, nome, cabeçalho, nº de colunas, (nome, tipo, não-nulo) por coluna, nº de colunas da chave e suas posições, nº de índices e (nome, único, raiz, nº de colunas, posições) por índice, coluna automática (−1 = nenhuma) e, por coluna, o padrão (0 nenhum; 1 + valor; 2 = agora). `sys_tabelas` e `sys_colunas` são visões calculadas.
 
 ## Tipos de página (planejados)
 bloco frio em colunas · resumo de bloco · ledger (os demais já existem).

@@ -521,7 +521,7 @@ fn modelo_de_tabelas_com_quedas() {
         Coluna::nova("nome", Tipo::Texto),
     ];
     let mut quedas = 0;
-    for semente in 0..25u64 {
+    for semente in 0..25 * fator_simulacao() {
         for (cifrado, sincronia) in modos {
             let ctx0 = format!("semente {semente}, cifrado {cifrado}, {sincronia:?}");
             let vfs = disco(semente);
@@ -840,4 +840,12 @@ fn indices_secundarios_e_unico() {
         Err(ErroCatalogo::UnicoViolado(_))
     ));
     tx.desfazer();
+}
+
+/// Multiplicador das rodadas de simulação (`SIOUX_SIM_FATOR`, usado na rodada noturna do CI).
+fn fator_simulacao() -> u64 {
+    std::env::var("SIOUX_SIM_FATOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
 }

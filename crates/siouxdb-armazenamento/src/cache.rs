@@ -45,8 +45,8 @@ impl<K: Hash + Eq + Clone, V: Clone> CacheSieve<K, V> {
         let capacidade = capacidade.max(1);
         CacheSieve {
             capacidade,
-            mapa: HashMap::with_capacity(capacidade),
-            nos: Vec::with_capacity(capacidade),
+            mapa: HashMap::with_capacity(capacidade.min(1024)),
+            nos: Vec::with_capacity(capacidade.min(1024)),
             vagas: Vec::new(),
             mais_novo: None,
             mais_antigo: None,
@@ -68,6 +68,14 @@ impl<K: Hash + Eq + Clone, V: Clone> CacheSieve<K, V> {
     /// Capacidade máxima.
     pub fn capacidade(&self) -> usize {
         self.capacidade
+    }
+
+    /// Muda a capacidade. Se diminuir, descarta o excedente.
+    pub fn definir_capacidade(&mut self, capacidade: usize) {
+        self.capacidade = capacidade.max(1);
+        while self.mapa.len() > self.capacidade {
+            self.descartar();
+        }
     }
 
     /// Contadores acumulados.
@@ -237,6 +245,21 @@ mod testes {
             c.inserir(i, ());
             assert!(c.len() <= 8);
         }
+    }
+
+    #[test]
+    fn muda_de_capacidade() {
+        let mut c = CacheSieve::novo(2);
+        c.inserir(1, 1);
+        c.inserir(2, 2);
+        c.definir_capacidade(4);
+        c.inserir(3, 3);
+        c.inserir(4, 4);
+        assert_eq!((c.len(), c.estatisticas().descartes), (4, 0));
+        c.definir_capacidade(1);
+        assert_eq!((c.len(), c.capacidade()), (1, 1));
+        c.inserir(9, 9);
+        assert_eq!(c.obter(&9), Some(9));
     }
 
     #[test]

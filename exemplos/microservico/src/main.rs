@@ -99,6 +99,8 @@ fn tipo_de(s: &str) -> R<Tipo> {
         "texto" => Tipo::Texto,
         "bytes" => Tipo::Bytes,
         "booleano" => Tipo::Booleano,
+        "decimal" => Tipo::Decimal,
+        "datahora" => Tipo::DataHora,
         o => return Err(ruim(format!("tipo desconhecido: {o}"))),
     })
 }
@@ -125,6 +127,9 @@ fn para_json(v: &Valor) -> J {
         Valor::Texto(t) => json!(t),
         Valor::Bytes(b) => json!(hex(b)),
         Valor::Booleano(b) => json!(b),
+        // Decimal vai como texto para não perder casas no JSON.
+        Valor::Decimal(d) => json!(d.to_string()),
+        Valor::DataHora(t) => json!(siouxdb::catalogo::datahora::para_texto(*t)),
     }
 }
 
@@ -137,6 +142,15 @@ fn de_json(v: &J, tipo: Tipo, coluna: &str) -> R<Valor> {
         (J::String(s), Tipo::Texto) => Valor::Texto(s.clone()),
         (J::String(s), Tipo::Bytes) => Valor::Bytes(de_hex(s)?),
         (J::Bool(b), Tipo::Booleano) => Valor::Booleano(*b),
+        (J::Number(n), Tipo::Decimal) => {
+            Valor::Decimal(siouxdb::catalogo::Decimal::de_texto(&n.to_string()).ok_or_else(erro)?)
+        }
+        (J::String(t), Tipo::Decimal) => {
+            Valor::Decimal(siouxdb::catalogo::Decimal::de_texto(t).ok_or_else(erro)?)
+        }
+        (J::String(t), Tipo::DataHora) => {
+            Valor::DataHora(siouxdb::catalogo::datahora::de_texto(t).ok_or_else(erro)?)
+        }
         _ => return Err(erro()),
     })
 }
@@ -155,6 +169,10 @@ fn de_texto(s: &str, tipo: Tipo, coluna: &str) -> R<Valor> {
         Tipo::Texto => Valor::Texto(s.to_string()),
         Tipo::Bytes => Valor::Bytes(de_hex(s)?),
         Tipo::Booleano => Valor::Booleano(s.parse().map_err(|_| erro())?),
+        Tipo::Decimal => Valor::Decimal(siouxdb::catalogo::Decimal::de_texto(s).ok_or_else(erro)?),
+        Tipo::DataHora => {
+            Valor::DataHora(siouxdb::catalogo::datahora::de_texto(s).ok_or_else(erro)?)
+        }
     })
 }
 
@@ -258,10 +276,11 @@ async fn criar_tabela(State(app): Estado, Json(corpo): Json<J>) -> R<(StatusCode
                 .as_str()
                 .ok_or_else(|| ruim("coluna sem \"tipo\""))?,
         )?;
-        colunas.push(Coluna {
-            nome: n.to_string(),
-            tipo: t,
-            nao_nulo: c["obrigatoria"].as_bool().unwrap_or(false),
+        let obrigatoria = c["obrigatoria"].as_bool().unwrap_or(false);
+        colunas.push(if obrigatoria {
+            Coluna::obrigatoria(n, t)
+        } else {
+            Coluna::nova(n, t)
         });
     }
     let chave: Vec<String> = corpo["chave"]

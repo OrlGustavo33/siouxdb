@@ -347,6 +347,8 @@ fn texto_valor(v: &siouxdb::catalogo::Valor) -> String {
         Valor::Texto(t) => t.clone(),
         Valor::Bytes(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
         Valor::Booleano(b) => b.to_string(),
+        Valor::Decimal(d) => d.to_string(),
+        Valor::DataHora(t) => siouxdb::catalogo::datahora::para_texto(*t),
     }
 }
 

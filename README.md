@@ -85,6 +85,9 @@ Só o motor é obrigatório; o resto é opcional. Embutido (como o SQLite) ou se
 - `siouxdb-indices`: **árvore B+** em páginas (chaves de tamanho variável, separadora curta, cursor por faixa, verificador de estrutura), testada contra o `BTreeMap` do Rust com milhares de operações aleatórias;
 - `siouxdb-catalogo`: **tabelas versionadas** — a camada quente é um livro-razão onde toda gravação anexa uma versão; índice da chave primária; histórico por linha e leitura **como estava no LSN tal**; catálogo com `sys_tabelas` e `sys_colunas`;
 - **valores grandes** (linha de até 16 MiB, em páginas de transbordo), **compactação** do histórico e **backup a quente**;
+- **tipos `DECIMAL`** (exato, 10 casas: `0.1 + 0.2 = 0.3`) e **`DATAHORA`** (ISO, UTC), **`DEFAULT`**, **numeração automática** (`SERIAL`) e **`ALTER TABLE`** (`ADD COLUMN` sem regravar nada, `RENAME`);
+- **manutenção automática** (`siouxdb::manutencao`): compacta tabelas com muito histórico e faz **backup periódico** com rodízio e teste de restauração (abre e lê a cópia inteira); **cache automático** (1/8 da memória, 16–512 MiB);
+- **formato 1 congelado**: arquivos de exemplo em `spec/exemplos/` são abertos em todo CI; testes de robustez (arquivo e WAL estragados, SQL aleatório) e simulação noturna longa (`.github/workflows/noturno.yml`);
 - **índices secundários** (inclusive `UNIQUE`) e **SQL** (`siouxdb-sql`): `CREATE/DROP TABLE|INDEX`, `INSERT` com conflito, `SELECT` com `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`AS OF`, `UPDATE`, `DELETE`, `EXPLAIN`, parâmetros `?`/`$1`;
 - comando `sioux criar | info | verificar | trocar-senha | checkpoint | tabelas | sql | backup | compactar`.
 - `siouxdb-metricas`: histograma sem trava, séries de 60 s e alertas configuráveis;
@@ -116,9 +119,10 @@ Na sincronia Total o limite é o `fsync` do disco; a confirmação em grupo é o
 ## Usar hoje (embutido)
 
 ```sql
-CREATE TABLE clientes (id INTEIRO PRIMARY KEY, nome TEXTO NOT NULL, cidade TEXTO, saldo REAL);
+CREATE TABLE clientes (id SERIAL PRIMARY KEY, nome TEXTO NOT NULL, cidade TEXTO, saldo DECIMAL DEFAULT 0, criado DATAHORA DEFAULT AGORA());
+ALTER TABLE clientes ADD COLUMN apelido TEXTO;
 CREATE INDEX clientes_cidade ON clientes (cidade);
-INSERT INTO clientes VALUES (1, 'ANA', 'SP', 10.5), (2, 'BIA', 'RJ', 0) ON CONFLICT DO NOTHING;
+INSERT INTO clientes (nome, cidade, saldo) VALUES ('ANA', 'SP', 10.5), ('BIA', 'RJ', 0.1);
 SELECT cidade, COUNT(*), SUM(saldo) FROM clientes WHERE saldo >= ? GROUP BY cidade ORDER BY 2 DESC LIMIT 10;
 UPDATE clientes SET saldo = saldo + 1 WHERE cidade = 'SP';
 SELECT * FROM clientes AS OF 3 WHERE id = 1;   -- como estava na confirmação 3
@@ -130,7 +134,7 @@ SELECT * FROM sys_tabelas;   -- e sys_colunas, sys_indices
 - Pela linha de comando: `sioux sql banco.sdb "SELECT ..."`.
 - Por HTTP: o exemplo [`exemplos/microservico`](exemplos/microservico) (`POST /sql` e rotas REST), com token obrigatório.
 
-O SQL é um subconjunto (uma tabela por consulta, sem JOIN nem subconsulta por enquanto). O planejador usa a chave primária ou um índice quando o `WHERE` tem `coluna = valor` ou faixas; um teste diferencial compara 1.500 consultas aleatórias com o mesmo filtro calculado fora do banco.
+O SQL é um subconjunto (uma tabela por consulta, sem JOIN nem subconsulta por enquanto; transação só dentro de uma chamada). O planejador usa a chave primária ou um índice quando o `WHERE` tem `coluna = valor` ou faixas; um teste diferencial compara 1.500 consultas aleatórias com o mesmo filtro calculado fora do banco.
 
 ## Compilar e testar
 

@@ -3,7 +3,7 @@
 use crate::Resultado;
 use crate::erro::semantica;
 use crate::parser::{Expr, Op};
-use siouxdb_catalogo::Valor;
+use siouxdb_catalogo::{Decimal, Valor, datahora};
 use std::cmp::Ordering;
 
 pub(crate) struct Ctx<'a> {
@@ -59,6 +59,20 @@ pub(crate) fn conferir_colunas(e: &Expr, nomes: &[String], extras: &[String]) ->
 pub(crate) fn comparar(a: &Valor, b: &Valor) -> Resultado<Option<Ordering>> {
     Ok(Some(match (a, b) {
         (Valor::Nulo, _) | (_, Valor::Nulo) => return Ok(None),
+        (Valor::Decimal(x), Valor::Inteiro(y)) => x.cmp(&Decimal::de_inteiro(*y)),
+        (Valor::Inteiro(x), Valor::Decimal(y)) => Decimal::de_inteiro(*x).cmp(y),
+        // Real comparado com decimal é convertido para decimal (10 casas): assim o filtro e
+        // o índice usam exatamente a mesma conta.
+        (Valor::Decimal(x), Valor::Real(y)) => match Decimal::de_real(*y) {
+            Some(d) => x.cmp(&d),
+            None => x.para_real().total_cmp(y),
+        },
+        (Valor::Real(x), Valor::Decimal(y)) => match Decimal::de_real(*x) {
+            Some(d) => d.cmp(y),
+            None => x.total_cmp(&y.para_real()),
+        },
+        (Valor::DataHora(x), Valor::Texto(t)) => x.cmp(&data_de(t)?),
+        (Valor::Texto(t), Valor::DataHora(y)) => data_de(t)?.cmp(y),
         (Valor::Inteiro(x), Valor::Real(y)) => (*x as f64).total_cmp(y),
         (Valor::Real(x), Valor::Inteiro(y)) => x.total_cmp(&(*y as f64)),
         (x, y) if x.tipo() == y.tipo() => x.comparar(y),
@@ -70,6 +84,25 @@ pub(crate) fn comparar(a: &Valor, b: &Valor) -> Resultado<Option<Ordering>> {
             ));
         }
     }))
+}
+
+fn data_de(t: &str) -> Resultado<i64> {
+    match datahora::de_texto(t) {
+        Some(d) => Ok(d),
+        None => semantica(format!(
+            "\"{t}\" não é uma data (use AAAA-MM-DD ou AAAA-MM-DD HH:MM:SS)"
+        )),
+    }
+}
+
+/// Valor como decimal, se for número.
+pub(crate) fn decimal_de(v: &Valor) -> Option<Decimal> {
+    match v {
+        Valor::Decimal(d) => Some(*d),
+        Valor::Inteiro(i) => Some(Decimal::de_inteiro(*i)),
+        Valor::Real(r) => Decimal::de_real(*r),
+        _ => None,
+    }
 }
 
 /// Ordem para ORDER BY: NULL primeiro, tipos diferentes pela ordem dos tipos.
@@ -110,6 +143,27 @@ fn numerico(op: Op, a: &Valor, b: &Valor) -> Resultado<Valor> {
             match r {
                 Some(v) => Inteiro(v),
                 None => return semantica("número inteiro fora do limite"),
+            }
+        }
+        (Valor::Decimal(_), Inteiro(_) | Real(_) | Valor::Decimal(_))
+        | (Inteiro(_) | Real(_), Valor::Decimal(_)) => {
+            let (Some(x), Some(y)) = (decimal_de(a), decimal_de(b)) else {
+                return semantica("número fora do limite do DECIMAL");
+            };
+            let r = match op {
+                Op::Mais => x.somar(y),
+                Op::Menos => x.subtrair(y),
+                Op::Vezes => x.multiplicar(y),
+                Op::Dividir | Op::Resto if y == Decimal::ZERO => {
+                    return semantica("divisão por zero");
+                }
+                Op::Dividir => x.dividir(y),
+                Op::Resto => x.bruto().checked_rem(y.bruto()).map(Decimal::de_bruto),
+                _ => None,
+            };
+            match r {
+                Some(d) => Valor::Decimal(d),
+                None => return semantica("número fora do limite do DECIMAL"),
             }
         }
         (Inteiro(_) | Real(_), Inteiro(_) | Real(_)) => {
@@ -187,6 +241,10 @@ pub(crate) fn avaliar(e: &Expr, ctx: &Ctx<'_>) -> Resultado<Valor> {
                     .or_else(|_| semantica("número fora do limite"))?,
             ),
             Valor::Real(r) => Valor::Real(-r),
+            Valor::Decimal(d) => match d.negativo() {
+                Some(d) => Valor::Decimal(d),
+                None => return semantica("número fora do limite"),
+            },
             Valor::Nulo => Valor::Nulo,
             _ => return semantica("sinal de menos em valor que não é número"),
         },
@@ -292,6 +350,8 @@ fn texto_de(v: &Valor) -> String {
         Valor::Real(r) => r.to_string(),
         Valor::Booleano(b) => b.to_string(),
         Valor::Bytes(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+        Valor::Decimal(d) => d.to_string(),
+        Valor::DataHora(t) => datahora::para_texto(*t),
         Valor::Nulo => String::new(),
     }
 }
@@ -326,9 +386,14 @@ fn funcao(nome: &str, v: Vec<Valor>) -> Resultado<Valor> {
                     .or_else(|_| semantica("número fora do limite"))?,
             ),
             Valor::Real(r) => Valor::Real(r.abs()),
+            Valor::Decimal(d) => match d.absoluto() {
+                Some(d) => Valor::Decimal(d),
+                None => return semantica("número fora do limite"),
+            },
             Valor::Nulo => Valor::Nulo,
             _ => return semantica("ABS() recebe número"),
         },
+        "agora" | "now" if v.is_empty() => Valor::DataHora(datahora::agora()),
         "coalesce" => v
             .into_iter()
             .find(|x| !matches!(x, Valor::Nulo))

@@ -1,0 +1,28 @@
+name: Simulação noturna
+
+# Rodada longa dos testes de modelo (transações e tabelas com quedas de energia) e de
+# robustez (arquivo estragado, SQL aleatório): 40 vezes mais sementes que no CI normal.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      fator:
+        description: Multiplicador das rodadas
+        default: "40"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  simulacao:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Modelos com quedas e testes de robustez
+        env:
+          SIOUX_SIM_FATOR: ${{ inputs.fator || '40' }}
+        run: cargo test --release -p siouxdb-transacoes -p siouxdb-catalogo -p siouxdb-sql -- modelo nunca_causa diferencial

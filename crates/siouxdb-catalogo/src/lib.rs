@@ -12,15 +12,18 @@
 //! uma transação.
 
 pub mod catalogo;
+pub mod datahora;
+pub mod decimal;
 mod erro;
 pub mod log;
 pub mod tabela;
 pub mod valor;
 
+pub use decimal::Decimal;
 pub use erro::{ErroCatalogo, Resultado};
 pub use tabela::{
-    Coluna, Contagem, DefIndice, DefTabela, ResumoCompactacao, Tabela, Varredura, VersaoLinha,
-    fim_do_prefixo,
+    Coluna, Contagem, DefIndice, DefTabela, Padrao, ResumoCompactacao, Tabela, Varredura,
+    VersaoLinha, fim_do_prefixo,
 };
 pub use valor::{Tipo, Valor};
 

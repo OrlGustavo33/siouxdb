@@ -3164,6 +3164,7 @@ dependencies = [
  "siouxdb-catalogo",
  "siouxdb-indices",
  "siouxdb-metricas",
+ "siouxdb-sql",
  "siouxdb-transacoes",
  "siouxdb-vfs",
 ]
@@ -3209,6 +3210,14 @@ name = "siouxdb-metricas"
 version = "0.0.1"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "siouxdb-sql"
+version = "0.0.1"
+dependencies = [
+ "siouxdb-catalogo",
+ "siouxdb-transacoes",
 ]
 
 [[package]]
