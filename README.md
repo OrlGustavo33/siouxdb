@@ -110,6 +110,22 @@ Banco **cifrado**, páginas de 8 KiB, cada transação altera 1 página, 2 leito
 
 Números de antes do **livro-razão**. Com ele, cada confirmação também reescreve a cabeça do razão e faz o hash das páginas alteradas (versão velha e nova; ~12 µs por página de 8 KiB nesta máquina). Na sincronia Total nada muda, porque o limite continua sendo o `fsync`. Na Normal, o pior caso (1 página por transação) cai para **4,0 mil/s** com 1 escritor e **3,3 mil/s** com 8. Um `INSERT` SQL de uma linha por transação vai de 2,2 mil/s para 1,6 mil/s.
 
+**Contra o SQLite** (mesma máquina e disco, 200 mil pedidos, cache de 64 MiB, SQLite 3.46 em modo WAL com comandos preparados; o SiouxDB ainda analisa o SQL a cada execução). `cargo run --release -p siouxdb-sql --example contra_sqlite`. Hoje o SQLite ganha em tudo:
+
+| Operação | SQLite | SiouxDB (sem cifra) | SiouxDB ÷ SQLite |
+|---|---|---|---|
+| INSERT, 1 por transação, durabilidade total (fsync) | 484/s | 334/s | 0,69× |
+| INSERT, 1 por transação, durabilidade normal | 17.424/s | 1.547/s | 0,09× |
+| INSERT em lote | 694 mil linhas/s | 109 mil linhas/s | 0,16× |
+| SELECT pela chave | 326 mil/s | 122 mil/s | 0,37× |
+| SELECT por índice (COUNT de um cliente, ~100 linhas) | 137 mil/s | 4,2 mil/s | 0,03× |
+| GROUP BY na tabela inteira | 3,3 mi linhas/s | 1,6 mi linhas/s | 0,47× |
+| ORDER BY ... LIMIT 10 | 12,9 mi linhas/s | 1,2 mi linhas/s | 0,09× |
+| JOIN + GROUP BY | 2,6 mi linhas/s | 0,45 mi linhas/s | 0,17× |
+| UPDATE de 10% | 196 mil linhas/s | 58 mil linhas/s | 0,30× |
+
+A cifra custa pouco (0–15%). As causas conhecidas: sem comando preparado, o SQL é analisado e o catálogo lido a cada execução; cada linha lida é decodificada inteira (o SQLite lê só as colunas pedidas); o índice secundário sempre volta à tabela (não há índice "cobridor"); e cada confirmação calcula o hash das páginas para o livro-razão.
+
 Tabela com 1 milhão de linhas (3 colunas, inseridas em ordem embaralhada, lotes de 10 mil por transação), `cargo run --release -p siouxdb-catalogo --example linhas -- 1000000 <pasta> <cache>`:
 
 | Cache | Inserir | Buscar pela chave (frio / quente) | Varrer |
