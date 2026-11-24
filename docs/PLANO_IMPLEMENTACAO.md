@@ -18,6 +18,10 @@
 | D4 | Repositório | Público e separado do ERP: `github.com/OrlGustavo33/siouxdb`, Cargo workspace | ✅ criado em 22/11 |
 | D5 | Rust mínimo | estável atual, edição 2024, MSRV fixado e testado no CI | proposta |
 | D6 | Plataformas da v0.1 | Linux x86_64/arm64, macOS, Windows | proposta |
+| D7 | Para quem otimizar | **Uso geral**, mas padrões, benchmarks e prioridades seguem o caso **ERP/varejo** (o TPC-C é praticamente um ERP de atacado). O motor nunca conhece "empresa", "venda" ou "nota": só peças neutras (chave de dono, soma sem trava, reserva com limite, sequência sem falha, agregado vivo). Dados de teste sempre fictícios | ✅ decidido 23/11 |
+| D8 | Formato do WAL para vários escritores | Guarda o resultado (linhas), nunca o comando (2.14) | decidir até o M5 |
+| D9 | Protocolo entre escritores | Duas etapas por senha: conferir → aplicar (2.14) | decidir até o M5 |
+| D10 | API de transação | Executa sozinha e só pega a senha no `COMMIT` (2.14) | decidir até o M5 |
 
 **Regras que não mudam:**
 1. Criptografia só com bibliotecas auditadas. O "algoritmo próprio" fica em índice e armazenamento, nunca em cifra.
@@ -111,7 +115,7 @@ Nomes de crates, tipos, funções e tabelas do sistema em **português** (ex.: `
 - **Crates:** `chacha20poly1305`, `aes-gcm`, `argon2`, `hmac`, `sha2`, `blake3`, `ed25519-dalek`, `rand_core`/`getrandom`, `zeroize`, `secrecy`.
 
 ### 2.4 WAL e transações — `siouxdb-storage` + `siouxdb-mvcc`
-- **Um escritor de cada vez** (trava de processo e de arquivo) e **leitores ilimitados** lendo uma foto.
+- **Um escritor de cada vez** (trava de processo e de arquivo) e **leitores ilimitados** lendo uma foto. Vários escritores sem conflito vêm depois, pela seção 2.14.
 - **Registro do WAL:** LSN, id da transação, operação, dados, CRC32C e hash encadeado ao registro anterior.
 - **Gravação em grupo:** junta as transações que chegam até `grupo_espera_max` e faz um só `fsync`.
 - **Recuperação ao abrir:** relê o WAL desde o último ponto de controle, descarta o final incompleto (CRC ou hash inválido) e reaplica. Como nada é sobrescrito no lugar, a recuperação é muito mais simples que um ARIES completo.
@@ -224,6 +228,114 @@ Objetivo: muitas conexões baratas, nenhuma conexão capaz de travar o banco, e 
 - **Regra de desenho:** simples e objetivo. Números grandes, verde/amarelo/vermelho só quando muda algo, nada de 40 gráficos. Atualiza a cada segundo, pausa quando a janela não está visível.
 - **Fontes:** arquivo local (o Studio abre o arquivo e lê as métricas do próprio processo) ou servidor (conecta em `/painel/fluxo` com token).
 
+### 2.14 Vários escritores: gerentes e escritores
+Objetivo: gravações em paralelo **sem conflito por construção**, sem trava e sem refazer, mantendo a ordem global que a cadeia de hashes, o `AS OF` e o `VERIFY` exigem. Até isso ficar pronto vale o escritor único da seção 2.4. Com `ESCRITORES_MAX = 1`, o banco volta exatamente a esse comportamento, e essa é a rede de segurança.
+
+**Peças:**
+- **Gerente (um por tabela):** é uma **regra de roteamento**, não uma thread. Quem calcula o destino é a própria transação, lendo a tabela de roteamento em memória. A regra de ouro: **a mesma chave vai sempre para o mesmo escritor.**
+- **Escritor (fatia):** dono exclusivo de uma fatia da tabela, com a árvore e **todos os índices** dela. Executa em sequência. Tabela comum tem 1 fatia, e tabela quente tem várias (por hash, por faixa ou combinadas).
+- **Escritor = fila lógica, núcleo = executor:** um conjunto fixo de threads (uma por núcleo) executa as filas. Escritor parado custa só memória, então 10 ou 10 mil escritores custam quase igual.
+- **Co-localização:** tabelas gravadas juntas são fatiadas pela mesma chave e caem no mesmo escritor (`JUNTO COM`). Uma transação típica fica inteira num escritor só.
+- **Senha global:** transação que atravessa escritores pega uma senha no ponto único. Cada escritor executa na ordem das senhas, então não existe travamento mútuo.
+- **Ponto único (sequenciador):** só dá o LSN, os números sem falha, confere as reservas, encadeia o hash e anexa o bloco ao WAL. O líder leva o lote inteiro que estiver esperando, e um `fsync` atende a todos. **Nunca** cifra, monta índice ou confere regra pesada ali dentro.
+- **Preparar fora da vez:** cifra das páginas e hash do conteúdo em todos os núcleos. O encadeamento no ponto único é só `hash(anterior ‖ resumo do bloco)`.
+- **Transação = um bloco só no WAL:** tudo ou nada entre escritores. Leitores continuam com foto num LSN global e enxergam todas as fatias no mesmo instante.
+
+```sql
+CREATE TABLE vendas      (...) GERENTE POR empresa_id ESCRITORES 8;
+CREATE TABLE itens_venda (...) GERENTE POR empresa_id JUNTO COM vendas;
+CREATE TABLE log_acesso  (...) GERENTE POR id ESCRITORES 4;
+CREATE TABLE clientes    (...);                          -- 1 escritor (padrão)
+CONFIGURAR ESCRITORES_MAX = 32;
+CONFIGURAR GERENTES = 'sugerir';                         -- desligado | sugerir | automatico
+```
+
+**O que o gerente faz em cada operação:**
+
+| Operação | Destino |
+|---|---|
+| `INSERT` com chave | hash → um escritor |
+| `INSERT` com id automático | cada escritor recebe uma faixa de ids e gera localmente |
+| `UPDATE/DELETE` pela chave | um escritor |
+| `UPDATE/DELETE` sem a chave | todos os escritores da tabela, cada um na sua fatia |
+| Valor único | tabela de reserva fatiada pela coluna única (ver problema 5) |
+| Leitura | não passa pelo gerente: lê direto da foto, em todas as fatias |
+
+**Linha quente sem trava:**
+- **Soma:** `col = col ± x` vira um movimento anotado (−3), sem fila. O valor = base + soma dos movimentos, e a compactação consolida depois.
+- **Reserva com limite:** com `CHECK (col >= 0)`, o ponto único garante atomicamente `valor − reservas pendentes ≥ x`. Aprova sem trava ou recusa na hora.
+- **`SEQUENCIAL_SEM_FALHA`:** o número é dado no ponto único, na confirmação, quando a ordem já é definitiva. Sem buraco e sem repetição (nota fiscal, pedido).
+
+**Em segundo plano, o gerente:** observa a fila de cada escritor e as chaves quentes; divide fatia sobrecarregada e junta fatias frias; sugere co-localização ("estas tabelas aparecem sempre juntas"). Tudo aparece em `sys_escritores` e `sys_rastreio(senha)`.
+
+**Decisões obrigatórias até o M5** (mudam o formato do WAL ou a API, e mudar depois é caro):
+1. **O WAL guarda o resultado (linhas gravadas), nunca o comando.** `agora()` e qualquer valor não determinístico são fixados na senha e gravados junto. Com o WAL por linha (e não por página), o teto de bytes por transação cai cerca de 20×.
+2. **Duas etapas por senha: conferir → aplicar.** Cada escritor confere a sua parte e reserva. Só se todos aprovarem, aplica. Nada é exposto antes da decisão, e não há recusa em cascata.
+3. **A transação executa sozinha e só pega a senha no `COMMIT`.** Ela lê da foto e anota o que vai gravar numa área particular. Transação interativa nunca segura escritor.
+
+**Problemas conhecidos e soluções:**
+
+| # | Problema | Solução |
+|---|---|---|
+| 1 | Transação interativa (`BEGIN`, lê, pensa, grava) seguraria os escritores | Senha só no `COMMIT` (decisão 3) |
+| 2 | Leu na foto, decidiu, e o valor mudou até a senha | **Gravação condicional:** o escritor reconfere o que foi lido ("baixe 8 **se** saldo ≥ 8"), e se não valer, recusa ou refaz |
+| 3 | Uma parte recusa depois que outras já executaram | Conferir → aplicar (decisão 2) |
+| 4 | Chave estrangeira entre escritores (item órfão) | Co-localizar pela chave estrangeira. Quando não der, a etapa de conferir reserva o pai contra exclusão |
+| 5 | Valor único em mais de uma coluna (CPF e e-mail) | Cada restrição única vira tabela de reserva com gerente próprio, na mesma senha |
+| 6 | Recuperação que reexecuta comandos dá resultado diferente | WAL com resultado (decisão 1) |
+| 7 | Filtro por coluna que não é a chave consulta todas as fatias | O gerente escolhe pelo uso: índice local por fatia ou índice global (tabela fatiada pela coluna indexada) |
+| 8 | Hash estraga busca por faixa, e faixa por data concentra tudo em "hoje" | Por tabela: `HASH`, `FAIXA` ou combinado (inquilino por hash, depois data por faixa) |
+| 9 | Carga em massa trava transação interativa no mesmo escritor | Prioridade na fila (`interativa` > `normal` > `massa`) e massa picada em lotes de ~1.000, devolvendo a vez |
+| 10 | Inquilino barulhento atrasa os outros do mesmo escritor | Justiça por chave de dono na fila e escritor exclusivo automático acima de um limite |
+| 11 | Áreas pendentes acumulam e a leitura fica lenta | Filtro de Bloom por área e freio na gravação acima do limite, com a compactação ganhando prioridade |
+| 12 | Dividir fatia no pico disputa disco | Divisão preguiçosa: gravação nova já vai para a fatia nova, migração em segundo plano com freio, leitura confere as duas. A troca do roteamento é um registro no WAL |
+| 13 | `ALTER TABLE` com vários escritores | Senha de barreira. Linhas guardam a versão da estrutura, e a conversão roda em segundo plano |
+| 14 | Difícil de depurar | Senha = identificador de rastreio; `sys_escritores` e `sys_rastreio(senha)` |
+| 15 | Combinações demais para testar | Simulador determinístico com semente: escritores, quedas, divisões e recusas sorteados, e a semente reproduz a falha |
+
+**Tetos esperados numa máquina** (estimativas, a confirmar por benchmark):
+- WAL por página: ~100 mil transações/s num NVMe. WAL por linha: o limite passa a ser CPU.
+- Ponto único com lote: ~1–2 µs por transação, ou seja, ~500 mil a 1 milhão/s.
+- Pioram com mais fatias: `UPDATE` sem chave e transação lenta segurando um escritor.
+- Além de uma máquina: um banco por grupo de inquilinos (o motor não muda).
+
+**Fases:**
+
+| Fase | Entrega | Quando |
+|---|---|---|
+| A | Cifra e hash fora da vez; líder leva o lote | Já, sobre o M3/M4 (ganho com escritor único) |
+| B | WAL por linha; área de gravação por transação; senha no `COMMIT` | M5 |
+| C | Gerentes e escritores com fatias manuais, senha global, conferir → aplicar, co-localização | v0.2 |
+| D | Soma sem trava, reserva com limite, `SEQUENCIAL_SEM_FALHA` | v0.2 |
+| E | Gerente automático (dividir, juntar, sugerir co-localização), índice global, prioridades e justiça | v0.4 |
+
+Descartados, com o motivo: grupos de tabelas com escritor próprio (o critério certo é "gravadas juntas", e o ganho fica restrito); funil de filas 5→4→3→2→1 (a vazão é a do trecho mais estreito, e os degraus só somam latência); N filas com conferência otimista por página (conflito falso e muito trabalho jogado fora na linha quente).
+
+### 2.15 Desempenho adaptativo (atalhos de leitura e gravação)
+Objetivo: o banco observa as consultas e gravações mais usadas e pesadas e cria atalhos, **só quando configurado**, sem nunca mudar a resposta.
+
+- **Observa:** `sys_consultas` com a consulta normalizada, execuções, tempo total e p99, linhas lidas e escritas (como o `pg_stat_statements`).
+- **Modos:** `CONFIGURAR OTIMIZACAO = 'desligado' | 'sugerir' | 'automatico'`, com teto de espaço (`OTIMIZACAO_ESPACO_MAX`).
+- **Atalhos de leitura:**
+  - índice automático;
+  - **agregado vivo:** `SUM/COUNT/MIN/MAX` agrupados, atualizado **na mesma transação** a partir do que entrou no WAL desde o último ponto. Também atende `AS OF`;
+  - cache de resultado invalidado pelas tabelas envolvidas;
+  - cópia em colunas para tabelas usadas só em relatório.
+- **Gravação:**
+  - `IMPORTAR` e API de lote: ordena, grava páginas prontas e monta os índices no fim, com cifra em paralelo. A carga vira um bloco só na cadeia;
+  - histórico guardando só a diferença no `UPDATE`;
+  - janela da confirmação em grupo adaptativa;
+  - sugere remover índice que ninguém lê e avisa sobre "uma transação por linha" em carga.
+- **Durabilidade por transação:** além do modo do banco (2.4), cada transação pode pedir `Total` ou `Normal` (venda `Total`, log `Normal`). Nenhum modo pode pular o `fsync` do checkpoint antes de zerar o WAL: perder as últimas confirmações é aceitável por escolha, **corromper nunca**.
+- **Regras de segurança:**
+  1. atalho novo roda **em sombra**, comparando com a consulta normal, e só passa a valer depois de N respostas idênticas;
+  2. sempre em dia (mesma transação);
+  3. removido sozinho se não compensar mais;
+  4. respeita a cifra (agregado de coluna cifrada fica cifrado com a mesma chave);
+  5. tudo listado em `sys_atalhos` com motivo, ganho e custo.
+- **IA (opcional, `sioux-ia`):** só explica em português e sugere reescrever a consulta. Quem decide é a estatística, que é previsível e explicável.
+- **Quando:** `sys_consultas` no M5; índice automático e cache em `sugerir` na v0.2; agregado vivo e modo `automatico` na v0.4.
+
 ---
 
 ## 3. Testes e confiança (vale para todas as fases)
@@ -310,11 +422,12 @@ Estimativas para **1 pessoa em tempo integral com apoio de agentes**. Cada marco
 - **Execução:** vetorizada com SIMD, materialização tardia, morsels, hash join particionado, spill para disco e `WITH ERRO` (respostas pelos resumos e amostragem).
 - **Índices:** ART, adaptativo (configurável por coluna) e aprendido (PGM).
 - **Configuração:**
-  - perfis (`Leve`, `Desktop`, `Servidor`, `Ingestao`, `Analise`, `BaixaLatencia`);
+  - perfis (`Leve`, `Desktop`, `Servidor`, `Ingestao`, `Analise`, `BaixaLatencia`, `Erp`); o perfil só muda padrões (o `Erp` liga gerentes por inquilino, atalhos em `sugerir`, prioridade para transação interativa e sincronia `Total`);
   - configuração por arquivo/código/SQL;
   - **modo automático por metas** (AIMD para concorrência, PID para lote e compactação, CoDel na fila), com limites rígidos, registro do motivo de cada ajuste e `CONFIG CONGELAR`.
 - **Mapa de uso:** por tabela e coluna, que gera sugestões em `sys_sugestoes`.
-- **Benchmarks públicos** TPC-H e YCSB contra SQLite e DuckDB.
+- **Benchmarks públicos** TPC-H e YCSB contra SQLite e DuckDB; **TPC-C** e uma **carga de ERP sintética** (lojas, vendas, estoque, financeiro, com dados fictícios) contra SQLite e PostgreSQL. A carga de ERP é a referência principal.
+- **Gerente automático e atalhos automáticos** (2.14 fase E e 2.15).
 
 ### v0.5+ — Escala e IA
 - **sioux-cluster:**
@@ -344,6 +457,7 @@ Estimativas para **1 pessoa em tempo integral com apoio de agentes**. Cada marco
 | Formato mudar e quebrar arquivos | `spec/` versionado; arquivos dourados no CI; leitura de versões antigas obrigatória |
 | Sync/Ponte gravando errado no sistema antigo | Somente leitura por padrão; escrita só por receita testada em homologação; dono por tabela |
 | IA alucinando mapeamento | IA só propõe; motor determinístico executa; revisão humana obrigatória; prévia e validação antes de gravar |
+| Vários escritores corrompendo dados (página com dois donos, recusa em cascata) | Página com dono único conferido sempre (nunca desligável); conferir → aplicar; transação = um bloco no WAL; simulador com semente; `ESCRITORES_MAX = 1` como volta segura |
 | Desempenho abaixo do prometido | Benchmarks publicados desde a v0.1, incluindo onde perdemos; otimizar guiado por medição |
 | Cliente do ERP Sioux com pressa de migrar antes da v0.2 madura | Armazém provisório atrás da mesma interface do `sioux-migra` (destino plugável), trocado depois |
 

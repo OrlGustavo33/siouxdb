@@ -251,7 +251,9 @@ impl Motor for Lite {
 }
 
 /// Resultado de uma rodada: (nome da operação, operações por segundo, unidade).
-fn rodada(m: &mut dyn Motor, linhas: u64) -> Vec<(&'static str, f64, &'static str)> {
+type Rodada = Vec<(&'static str, f64, &'static str)>;
+
+fn rodada(m: &mut dyn Motor, linhas: u64) -> Rodada {
     let mut r = Vec::new();
     let total = m_sinc(m);
     // 1. Uma linha por transação (o caso de um caixa gravando venda a venda).
@@ -370,7 +372,7 @@ fn main() {
             Box::new(Sioux::novo(&pasta, false, sincronia)),
             Box::new(Sioux::novo(&pasta, true, sincronia)),
         ];
-        let mut tabela: Vec<(String, Vec<(&str, f64, &str)>)> = Vec::new();
+        let mut tabela: Vec<(String, Rodada)> = Vec::new();
         for m in motores.iter_mut() {
             let rotulo = m.rotulo();
             eprintln!("rodando {rotulo}...");
