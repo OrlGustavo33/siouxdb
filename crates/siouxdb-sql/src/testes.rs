@@ -1437,7 +1437,7 @@ fn consultas_respeitam_o_limite_de_memoria() {
         )
         .unwrap();
         let mut todos: Vec<(i64, i64)> = (0..n).map(|i| ((i * 7919) % n, i)).collect();
-        todos.sort_by(|a, b| b.0.cmp(&a.0));
+        todos.sort_by_key(|x| std::cmp::Reverse(x.0));
         let esperado: Vec<Vec<Valor>> =
             todos[1..5].iter().map(|&(x, i)| vec![v(x), v(i)]).collect();
         assert_eq!(r.linhas, esperado);
