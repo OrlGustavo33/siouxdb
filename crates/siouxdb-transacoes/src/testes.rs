@@ -448,6 +448,8 @@ fn modelo_com_quedas_em_qualquer_ponto() {
             let config = Config {
                 sincronia,
                 checkpoint_apos_paginas: 12,
+                // Metade das sementes derrama páginas no WAL antes de confirmar.
+                paginas_sujas_max: if semente % 2 == 0 { 2 } else { 0 },
                 ..Config::default()
             };
             let mut sorteio = Sorteio(semente.wrapping_mul(7919) + u64::from(cifrado));
@@ -727,4 +729,116 @@ fn razao_pega_entrada_alterada_e_arquivo_que_voltou_no_tempo() {
         r.problemas.iter().any(|p| p.contains("cadeia quebrada")),
         "{r:?}"
     );
+}
+
+// ---------------------------------------------------------------- derrame no WAL
+
+fn config_derrame() -> Config {
+    Config {
+        paginas_sujas_max: 4,
+        checkpoint_apos_paginas: 0,
+        ..Config::default()
+    }
+}
+
+#[test]
+fn transacao_grande_derrama_no_wal_e_confirma_inteira() {
+    for cifrado in [false, true] {
+        let vfs = disco(50);
+        let b = criar(&vfs, cifrado, config_derrame());
+        let mut tx = b.escrever().unwrap();
+        let paginas: Vec<_> = (0..60)
+            .map(|i| {
+                let n = tx.alocar(TipoPagina::NoArvore).unwrap();
+                escrever(&mut tx, n, marca(&format!("a{i}")));
+                n
+            })
+            .collect();
+        // As primeiras já foram para o WAL: a transação ainda as enxerga e pode mudá-las.
+        assert_eq!(
+            &tx.pagina(paginas[0]).unwrap().conteudo()[..16],
+            &marca("a0")
+        );
+        for (i, &n) in paginas.iter().enumerate().step_by(3) {
+            tx.pagina_mut(n).unwrap().conteudo_mut()[..16]
+                .copy_from_slice(&marca(&format!("b{i}")));
+        }
+        tx.liberar(paginas[1]).unwrap();
+        // Uma foto aberta não vê nada antes da confirmação.
+        let foto = b.ler().unwrap();
+        tx.confirmar().unwrap();
+        assert_eq!(foto.meta().total_paginas, 2);
+        drop(foto);
+        let esperado = |i: usize| {
+            if i % 3 == 0 {
+                marca(&format!("b{i}"))
+            } else {
+                marca(&format!("a{i}"))
+            }
+        };
+        let conferir = |b: &B| {
+            for (i, &n) in paginas.iter().enumerate() {
+                if i != 1 {
+                    assert_eq!(conteudo(b, n), esperado(i), "cifrado={cifrado} página {i}");
+                }
+            }
+            // Liberada (e talvez já reaproveitada pela cabeça do razão, criada nesta confirmação).
+            assert_ne!(
+                b.ler().unwrap().pagina(paginas[1]).unwrap().tipo(),
+                TipoPagina::NoArvore
+            );
+            let r = b.verificar_razao(None).unwrap();
+            assert!(r.ok(), "{r:?}");
+        };
+        conferir(&b);
+        drop(b);
+        let b = abrir(&vfs, cifrado, config_derrame());
+        conferir(&b);
+        b.checkpoint().unwrap();
+        conferir(&b);
+        drop(b);
+        let b = abrir(&vfs, cifrado, config_derrame());
+        conferir(&b);
+    }
+}
+
+#[test]
+fn derrame_desfeito_e_queda_no_meio_nao_deixam_rastro() {
+    for cifrado in [false, true] {
+        let vfs = disco(51);
+        let b = criar(&vfs, cifrado, config_derrame());
+        let mut tx = b.escrever().unwrap();
+        let n = tx.alocar(TipoPagina::NoArvore).unwrap();
+        escrever(&mut tx, n, marca("antes"));
+        tx.confirmar().unwrap();
+        let total = b.ler().unwrap().meta().total_paginas;
+
+        // Derrama e desfaz.
+        let mut tx = b.escrever().unwrap();
+        for i in 0..40 {
+            let m = tx.alocar(TipoPagina::NoArvore).unwrap();
+            escrever(&mut tx, m, marca(&format!("x{i}")));
+        }
+        escrever(&mut tx, n, marca("desfeita"));
+        tx.desfazer();
+        assert_eq!(conteudo(&b, n), marca("antes"));
+        // A próxima grava por cima do que foi derramado.
+        let mut tx = b.escrever().unwrap();
+        escrever(&mut tx, n, marca("depois"));
+        tx.confirmar().unwrap();
+
+        // Derrama e cai antes de confirmar.
+        let mut tx = b.escrever().unwrap();
+        for i in 0..40 {
+            let m = tx.alocar(TipoPagina::NoArvore).unwrap();
+            escrever(&mut tx, m, marca(&format!("y{i}")));
+        }
+        std::mem::forget(tx); // a "queda" acontece com a transação aberta
+        drop(b);
+        vfs.queda();
+        let b = abrir(&vfs, cifrado, config_derrame());
+        assert_eq!(conteudo(&b, n), marca("depois"), "cifrado={cifrado}");
+        assert_eq!(b.ler().unwrap().meta().total_paginas, total);
+        assert!(b.verificar_razao(None).unwrap().ok());
+    }
 }

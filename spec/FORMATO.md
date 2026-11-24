@@ -99,6 +99,8 @@ Cada quadro tem 40 bytes de cabeçalho — tipo (u8), reservado (7), número da 
 
 O CRC de cada quadro **continua** o do anterior (`crc32c(anterior ++ campos ++ conteúdo)`).
 
+**Transação grande:** quando passa de `paginas_sujas_max` páginas na memória, a transação grava quadros de página no WAL antes da confirmação (mesmo LSN, CRC encadeado). A mesma página pode aparecer mais de uma vez na transação: **vale o último quadro**. A quantidade no quadro de confirmação conta todos os quadros da transação. Sem a confirmação, a recuperação descarta tudo; se a transação é desfeita, o fim do WAL não anda e a próxima grava por cima (os quadros que sobrarem depois quebram o encadeamento do CRC e são ignorados).
+
 ### Recuperação
 1. Lê o cabeçalho do WAL; se não for deste banco (identificador, tamanho de página) ou estiver ilegível, o WAL recomeça vazio.
 2. Lê os quadros em ordem; **para** no primeiro com sal diferente, CRC que não confere ou que não cabe no arquivo (gravação cortada por queda).

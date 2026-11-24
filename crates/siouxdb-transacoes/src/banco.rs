@@ -47,6 +47,10 @@ pub struct Config {
     pub cache_paginas: usize,
     /// Páginas do WAL guardadas em memória. 0 = automático (1/4 do cache principal).
     pub cache_wal: usize,
+    /// Páginas alteradas que uma transação guarda na memória; passou disso, elas vão para o
+    /// WAL antes da confirmação (sem marca de confirmação, não valem numa queda) e a
+    /// memória fica só com a posição. **0 = automático**: 64 MiB de páginas.
+    pub paginas_sujas_max: usize,
 }
 
 impl Default for Config {
@@ -57,6 +61,7 @@ impl Default for Config {
             espera_maxima_escritor: Duration::from_secs(5),
             cache_paginas: 0,
             cache_wal: 0,
+            paginas_sujas_max: 0,
         }
     }
 }
@@ -382,6 +387,8 @@ impl<A: Arquivo> Banco<A> {
             meta,
             meta_inicial: meta,
             sujas: BTreeMap::new(),
+            derramadas: BTreeMap::new(),
+            derrame: None,
         })
     }
 
@@ -730,6 +737,18 @@ pub struct Transacao<'a, A: Arquivo> {
     pub(crate) meta: Meta,
     pub(crate) meta_inicial: Meta,
     pub(crate) sujas: BTreeMap<NumeroPagina, Arc<Pagina>>,
+    /// Páginas que já foram para o WAL antes da confirmação: posição do quadro mais novo.
+    derramadas: BTreeMap<NumeroPagina, u64>,
+    /// Onde o próximo quadro desta transação vai no WAL, o CRC encadeado até ali e quantos
+    /// quadros ela já gravou (só existe depois do primeiro derrame).
+    derrame: Option<Derrame>,
+}
+
+struct Derrame {
+    fim: u64,
+    crc: u32,
+    quadros: u64,
+    sequencia: u64,
 }
 
 impl<A: Arquivo> Transacao<'_, A> {
@@ -758,14 +777,89 @@ impl<A: Arquivo> Transacao<'_, A> {
         if let Some(p) = self.sujas.get(&numero) {
             return Ok(Arc::clone(p));
         }
+        if let Some(&pos) = self.derramadas.get(&numero) {
+            // Sem cache: a posição pode ser reaproveitada se esta transação for desfeita.
+            let bytes = self.banco.ler_quadro(pos)?;
+            return Ok(Arc::new(self.banco.paginador.do_disco(numero, bytes)?));
+        }
         self.banco.pagina_em(self.base_lsn, &self.meta, numero)
+    }
+
+    /// Páginas alteradas por esta transação (na memória ou já derramadas no WAL).
+    pub(crate) fn paginas_alteradas(&self) -> Vec<NumeroPagina> {
+        let mut v: Vec<NumeroPagina> = self.sujas.keys().copied().collect();
+        v.extend(
+            self.derramadas
+                .keys()
+                .filter(|n| !self.sujas.contains_key(n)),
+        );
+        v.sort_unstable();
+        v
+    }
+
+    fn limite_sujas(&self) -> usize {
+        match self.banco.config.paginas_sujas_max {
+            0 => ((64usize << 20) / self.banco.paginador.tamanho_pagina().bytes()).max(256),
+            n => n.max(2),
+        }
+    }
+
+    /// Antes de pôr mais uma página na memória: se já tem o limite, manda as que estão na
+    /// memória para o WAL.
+    fn abrir_espaco(&mut self, numero: NumeroPagina) -> Resultado<()> {
+        if self.sujas.len() >= self.limite_sujas() && !self.sujas.contains_key(&numero) {
+            self.derramar()?;
+        }
+        Ok(())
+    }
+
+    /// Grava no WAL as páginas que estão na memória, como quadros desta transação (o LSN
+    /// dela, encadeados no CRC). Sem o quadro de confirmação, a recuperação os descarta; se a
+    /// transação for desfeita, o fim do WAL não andou e a próxima grava por cima.
+    fn derramar(&mut self) -> Resultado<()> {
+        let banco = self.banco;
+        let lsn = self.lsn();
+        let (sal, sequencia, fim, crc) = {
+            let e = banco.travar();
+            if e.falhou {
+                return Err(ErroBanco::Falhou);
+            }
+            match &self.derrame {
+                Some(d) => (e.cabecalho.sal, d.sequencia, d.fim, d.crc),
+                None => (e.cabecalho.sal, e.cabecalho.sequencia, e.fim, e.crc),
+            }
+        };
+        let tam = banco.paginador.tamanho_pagina().bytes();
+        let mut m = Montador::novo(crc, self.sujas.len() * (TAMANHO_QUADRO + tam));
+        let mut posicoes = Vec::with_capacity(self.sujas.len());
+        for (n, p) in std::mem::take(&mut self.sujas) {
+            let mut p = Arc::try_unwrap(p).unwrap_or_else(|compartilhada| (*compartilhada).clone());
+            p.definir_lsn(lsn);
+            let disco = banco.paginador.para_disco(n, &mut p)?;
+            let pos = m.quadro(&wal::campos_quadro(TIPO_PAGINA, n, lsn, sal), &disco);
+            posicoes.push((n, fim + pos as u64));
+        }
+        banco.wal.gravar_em(fim, &m.bytes)?;
+        banco
+            .quadros_gravados
+            .fetch_add(posicoes.len() as u64, Ordering::Relaxed);
+        let quadros = self.derrame.as_ref().map_or(0, |d| d.quadros) + posicoes.len() as u64;
+        self.derrame = Some(Derrame {
+            fim: fim + m.bytes.len() as u64,
+            crc: m.crc,
+            quadros,
+            sequencia,
+        });
+        self.derramadas.extend(posicoes);
+        Ok(())
     }
 
     /// Página para alterar no lugar (traz para a transação se ainda não estiver; a cópia
     /// acontece uma vez por página por transação).
     pub fn pagina_mut(&mut self, numero: NumeroPagina) -> Resultado<&mut Pagina> {
         if !self.sujas.contains_key(&numero) {
-            let p = self.banco.pagina_em(self.base_lsn, &self.meta, numero)?;
+            self.abrir_espaco(numero)?;
+            let p = self.pagina(numero)?;
             self.sujas.insert(numero, p);
         }
         Ok(Arc::make_mut(
@@ -788,6 +882,7 @@ impl<A: Arquivo> Transacao<'_, A> {
                 .into(),
             );
         }
+        self.abrir_espaco(numero)?;
         self.sujas.insert(numero, Arc::new(pagina));
         Ok(())
     }
@@ -809,6 +904,7 @@ impl<A: Arquivo> Transacao<'_, A> {
             self.meta.total_paginas += 1;
             n
         };
+        self.abrir_espaco(n)?;
         self.sujas.insert(n, Arc::new(self.pagina_nova(tipo)));
         Ok(n)
     }
@@ -820,6 +916,7 @@ impl<A: Arquivo> Transacao<'_, A> {
         }
         let mut livre = self.pagina_nova(TipoPagina::Livre);
         livre.conteudo_mut()[..8].copy_from_slice(&self.meta.primeira_livre.to_le_bytes());
+        self.abrir_espaco(numero)?;
         self.sujas.insert(numero, Arc::new(livre));
         self.meta.primeira_livre = numero;
         Ok(())
@@ -839,7 +936,7 @@ impl<A: Arquivo> Transacao<'_, A> {
     /// de o WAL estar no disco.
     pub fn confirmar(mut self) -> Resultado<u64> {
         let banco = self.banco;
-        if self.sujas.is_empty() && self.meta == self.meta_inicial {
+        if self.sujas.is_empty() && self.derramadas.is_empty() && self.meta == self.meta_inicial {
             return Ok(self.base_lsn);
         }
         let inicio = Instant::now();
@@ -853,38 +950,53 @@ impl<A: Arquivo> Transacao<'_, A> {
         }
         let sal = e.cabecalho.sal;
         let sequencia = e.cabecalho.sequencia;
+        // Com páginas derramadas, os quadros desta transação continuam de onde pararam.
+        let (inicio_tx, crc_tx, quadros_antes) = match &self.derrame {
+            Some(d) if d.sequencia != sequencia => return Err(ErroBanco::Falhou),
+            Some(d) => (d.fim, d.crc, d.quadros),
+            None => (e.fim, e.crc, 0),
+        };
         let mut m = Montador::novo(
-            e.crc,
+            crc_tx,
             self.sujas.len() * (TAMANHO_QUADRO + tam) + TAMANHO_QUADRO + TAMANHO_CONFIRMACAO,
         );
         // A cabeça do razão é a mesma página reescrita a cada confirmação (o checkpoint a copia
         // uma vez só): não conta para o ritmo de fsync e de checkpoint.
-        let contadas =
-            self.sujas.len() as u64 - u64::from(self.sujas.contains_key(&self.meta.raiz_razao));
+        let alteradas = self.paginas_alteradas();
+        let contadas = alteradas.len() as u64
+            - u64::from(alteradas.binary_search(&self.meta.raiz_razao).is_ok());
+        drop(alteradas);
         let mut novas = Vec::with_capacity(self.sujas.len());
         for (n, p) in std::mem::take(&mut self.sujas) {
             let mut p = Arc::try_unwrap(p).unwrap_or_else(|compartilhada| (*compartilhada).clone());
             p.definir_lsn(lsn);
             let disco = banco.paginador.para_disco(n, &mut p)?;
             let pos = m.quadro(&wal::campos_quadro(TIPO_PAGINA, n, lsn, sal), &disco);
-            novas.push((n, e.fim + pos as u64, p));
+            novas.push((n, inicio_tx + pos as u64, p));
         }
         let campos = wal::campos_quadro(TIPO_CONFIRMACAO, 0, lsn, sal);
         let conteudo = wal::conteudo_confirmacao(
             &banco.paginador,
             &campos,
             &self.meta,
-            novas.len() as u32,
+            (quadros_antes + novas.len() as u64) as u32,
             m.crc,
         )?;
         m.quadro(&campos, &conteudo);
-        if let Err(erro) = banco.wal.gravar_em(e.fim, &m.bytes) {
+        if let Err(erro) = banco.wal.gravar_em(inicio_tx, &m.bytes) {
             e.falhou = true;
             return Err(erro.into());
         }
-        e.fim += m.bytes.len() as u64;
+        e.fim = inicio_tx + m.bytes.len() as u64;
         e.crc = m.crc;
-        e.paginas += novas.len() as u64;
+        e.paginas += quadros_antes + novas.len() as u64;
+        // As derramadas que não voltaram a mudar valem pelo quadro que já está no WAL.
+        for (&n, &pos) in &self.derramadas {
+            // `novas` está em ordem de página (veio de um BTreeMap).
+            if novas.binary_search_by_key(&n, |(m, _, _)| *m).is_err() {
+                e.indice.entry(n).or_default().push((lsn, pos));
+            }
+        }
         e.desde_checkpoint += contadas;
         let novas_paginas = contadas;
         banco

@@ -272,13 +272,14 @@ pub(crate) fn registrar<A: Arquivo>(tx: &mut Transacao<'_, A>) -> Resultado<()> 
         cab.entradas.clear();
     }
     // Só as páginas alteradas mudam a soma: tira a versão de antes, põe a nova.
+    // (Inclui as que já foram derramadas no WAL: são relidas de lá, uma por vez.)
     let base_total = tx.meta_inicial.total_paginas;
-    for (&n, nova) in &tx.sujas {
+    for n in tx.paginas_alteradas() {
         if n < base_total {
             let velha = tx.banco.pagina_em(tx.base_lsn, &tx.meta_inicial, n)?;
             cab.soma.aplicar(n, &velha, false);
         }
-        cab.soma.aplicar(n, nova, true);
+        cab.soma.aplicar(n, &*tx.pagina(n)?, true);
     }
     let mut meta = tx.meta;
     meta.ultimo_lsn = lsn;
