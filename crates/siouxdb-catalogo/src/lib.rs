@@ -23,7 +23,7 @@ pub use decimal::Decimal;
 pub use erro::{ErroCatalogo, Resultado};
 pub use tabela::{
     Coluna, Contagem, DefIndice, DefTabela, Padrao, ResumoCompactacao, Tabela, Varredura,
-    VersaoLinha, fim_do_prefixo,
+    VarreduraIndice, VersaoLinha, fim_do_prefixo,
 };
 pub use valor::{Tipo, Valor};
 

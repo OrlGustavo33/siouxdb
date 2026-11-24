@@ -1513,3 +1513,42 @@ fn round_em_decimal_e_exato_e_funcoes_de_texto() {
         vec![vec![v("iou"), v("a"), v("abc"), v(3), Valor::Nulo, v("x")]]
     );
 }
+
+#[test]
+fn indice_cobridor_responde_sem_ir_a_tabela() {
+    let (_vfs, b) = banco();
+    exec(
+        &b,
+        "CREATE TABLE v (id INTEIRO PRIMARY KEY, cliente INTEIRO, total REAL, obs TEXTO); CREATE INDEX v_c ON v (cliente)",
+        &[],
+    );
+    for i in 0..300 {
+        exec(
+            &b,
+            "INSERT INTO v VALUES (?, ?, 1.5, 'x')",
+            &[v(i), v(i % 30)],
+        );
+    }
+    exec(
+        &b,
+        "DELETE FROM v WHERE id < 10; UPDATE v SET cliente = 99 WHERE id = 50",
+        &[],
+    );
+    assert!(plano(&b, "SELECT COUNT(*) FROM v WHERE cliente = 7", &[]).contains("só o índice"));
+    assert!(plano(&b, "SELECT id FROM v WHERE cliente = 7", &[]).contains("só o índice"));
+    // Coluna fora do índice, ou REAL: vai à tabela.
+    assert!(!plano(&b, "SELECT obs FROM v WHERE cliente = 7", &[]).contains("só o índice"));
+    assert!(!plano(&b, "SELECT total FROM v WHERE cliente = 7", &[]).contains("só o índice"));
+    assert_eq!(
+        q(&b, "SELECT COUNT(*) FROM v WHERE cliente = 20", &[]),
+        vec![vec![v(9)]]
+    );
+    assert_eq!(
+        q(&b, "SELECT COUNT(*) FROM v WHERE cliente = 99", &[]),
+        vec![vec![v(1)]]
+    );
+    assert_eq!(
+        q(&b, "SELECT id FROM v WHERE cliente = 99", &[]),
+        vec![vec![v(50)]]
+    );
+}

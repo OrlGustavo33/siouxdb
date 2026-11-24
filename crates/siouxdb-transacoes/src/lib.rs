@@ -25,7 +25,7 @@ pub mod razao;
 mod wal;
 
 pub use banco::{
-    Banco, Config, EstatisticasBanco, Leitura, Paginas, PaginasMut, Sincronia, Transacao,
+    Banco, Config, EstatisticasBanco, Leitura, Lembra, Paginas, PaginasMut, Sincronia, Transacao,
     cache_automatico_bytes,
 };
 pub use erro::{ErroBanco, Resultado};

@@ -226,6 +226,58 @@ pub fn codificar_chave(valores: &[Valor]) -> Resultado<Vec<u8>> {
     Ok(s)
 }
 
+/// Lê `n` valores de uma chave codificada por [`codificar_chave`]; devolve os valores e o
+/// resto dos bytes. O real `-0.0` volta como `0.0` (a chave não distingue os dois).
+pub fn decodificar_chave(mut b: &[u8], n: usize) -> Resultado<(Vec<Valor>, &[u8])> {
+    const RUIM: ErroCatalogo = ErroCatalogo::Corrompido("chave com forma inesperada");
+    fn tirar<'a>(b: &mut &'a [u8], n: usize) -> Resultado<&'a [u8]> {
+        if b.len() < n {
+            return Err(RUIM);
+        }
+        let (a, resto) = b.split_at(n);
+        *b = resto;
+        Ok(a)
+    }
+    fn escapados(b: &mut &[u8]) -> Resultado<Vec<u8>> {
+        let mut v = Vec::new();
+        loop {
+            let x = tirar(b, 1)?[0];
+            if x != 0 {
+                v.push(x);
+                continue;
+            }
+            match tirar(b, 1)?[0] {
+                0 => return Ok(v),
+                0xFF => v.push(0),
+                _ => return Err(RUIM),
+            }
+        }
+    }
+    let u64_de = |x: &[u8]| u64::from_be_bytes(x.try_into().expect("8"));
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(match tirar(&mut b, 1)?[0] {
+            0 => Valor::Nulo,
+            1 => Valor::Booleano(tirar(&mut b, 1)?[0] != 0),
+            2 => Valor::Inteiro((u64_de(tirar(&mut b, 8)?) ^ (1 << 63)) as i64),
+            3 => {
+                let o = u64_de(tirar(&mut b, 8)?);
+                let bits = if o >> 63 == 1 { o ^ (1 << 63) } else { !o };
+                Valor::Real(f64::from_bits(bits))
+            }
+            4 => Valor::Texto(String::from_utf8(escapados(&mut b)?).map_err(|_| RUIM)?),
+            5 => Valor::Bytes(escapados(&mut b)?),
+            6 => Valor::Decimal(Decimal::de_bruto(
+                (u128::from_be_bytes(tirar(&mut b, 16)?.try_into().expect("16")) ^ (1 << 127))
+                    as i128,
+            )),
+            7 => Valor::DataHora((u64_de(tirar(&mut b, 8)?) ^ (1 << 63)) as i64),
+            _ => return Err(RUIM),
+        });
+    }
+    Ok((v, b))
+}
+
 /// Codifica uma linha para o log.
 pub fn codificar_linha(valores: &[Valor]) -> Vec<u8> {
     let mut s = Vec::with_capacity(2 + valores.len() * 9);

@@ -327,10 +327,11 @@ impl Gerador {
 
     /// Devolve o SQL e se a ordem do resultado é garantida (então compara linha a linha).
     fn consulta(&mut self) -> (String, bool) {
-        match self.s.n(10) {
+        match self.s.n(11) {
             0..=3 => self.simples(),
             4..=6 => self.agrupada(),
             7 => self.agregada(),
+            8 => self.coberta(),
             _ => self.juncao(),
         }
     }
@@ -388,6 +389,38 @@ impl Gerador {
             )
         } else {
             (format!("SELECT {} FROM t1{onde}", itens.join(", ")), false)
+        }
+    }
+
+    /// Consulta que um índice responde sozinho (colunas do índice e da chave).
+    fn coberta(&mut self) -> (String, bool) {
+        self.qual = false;
+        let (col, v) = if self.s.chance(50) {
+            ("a", format!("{}", self.s.n(12) as i64 - 3))
+        } else {
+            ("c", format!("'{}'", self.s.um(&PALAVRAS)))
+        };
+        let cmp = self.s.um(&["=", "=", "<", ">=", "<>"]);
+        match self.s.n(3) {
+            0 => (
+                format!("SELECT COUNT(*) FROM t1 WHERE {col} {cmp} {v}"),
+                true,
+            ),
+            1 => {
+                let lim = self.limite();
+                (
+                    format!(
+                        "SELECT id, {col} FROM t1 WHERE {col} {cmp} {v} ORDER BY {col}, id{lim}"
+                    ),
+                    true,
+                )
+            }
+            _ => (
+                format!(
+                    "SELECT {col}, COUNT(*), MIN(id) FROM t1 WHERE {col} {cmp} {v} GROUP BY {col} ORDER BY {col}"
+                ),
+                true,
+            ),
         }
     }
 
@@ -520,6 +553,26 @@ fn preparar(semente: u64) -> (VfsSimulado, B, rusqlite::Connection) {
         ];
         let v: Vec<String> = v.into_iter().map(|x| nulo_ou(&mut s, x)).collect();
         cmds.push(format!("INSERT INTO t2 VALUES ({id}, {})", v.join(", ")));
+    }
+    // Mutações depois da carga: os índices têm de acompanhar (inclusive chave trocada).
+    for _ in 0..12 {
+        let m = match s.n(5) {
+            0 => format!(
+                "UPDATE t1 SET a = {} WHERE id % {} = {}",
+                s.n(12) as i64 - 3,
+                2 + s.n(4),
+                s.n(2)
+            ),
+            1 => format!(
+                "UPDATE t1 SET c = '{}' WHERE a = {}",
+                s.um(&PALAVRAS),
+                s.n(9) as i64 - 3
+            ),
+            2 => format!("DELETE FROM t1 WHERE b > {}", 10 + s.n(10)),
+            3 => format!("UPDATE t1 SET id = id + 1000 WHERE id = {}", 1 + s.n(40)),
+            _ => format!("DELETE FROM t2 WHERE e = {}", s.n(15)),
+        };
+        cmds.push(m);
     }
     let mut tx = b.escrever().unwrap();
     for c in &cmds {

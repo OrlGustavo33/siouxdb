@@ -202,15 +202,88 @@ fn planejar_preds(t: &Tabela, preds: Vec<(usize, Op, Valor)>, lsn: u64) -> Acess
     melhor.map_or(Acesso::Tudo, |(_, a)| a)
 }
 
-/// Passa cada linha (antes do filtro) para `f`; `f` devolve `false` para parar.
+/// Colunas (posições) que uma expressão usa; `None` se alguma não for coluna da tabela.
+fn colunas_da_expr(e: &Expr, nomes: &[String], v: &mut Vec<usize>) -> Option<()> {
+    let mut r = |x: &Expr| colunas_da_expr(x, nomes, v);
+    match e {
+        Expr::Coluna(c) => {
+            let i = resolver_coluna(nomes, c).ok()?;
+            v.push(i);
+        }
+        Expr::Funcao(_, args, _) => args.iter().try_for_each(&mut r)?,
+        Expr::Nao(a) | Expr::Negativo(a) | Expr::EhNulo(a, _) => r(a)?,
+        Expr::Bin(_, a, b) | Expr::Como(a, b, _) => {
+            r(a)?;
+            r(b)?;
+        }
+        Expr::Em(a, l, _) => {
+            r(a)?;
+            l.iter().try_for_each(&mut r)?;
+        }
+        Expr::Entre(a, b, c, _) => {
+            r(a)?;
+            r(b)?;
+            r(c)?;
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+/// Colunas da tabela que um SELECT usa (`None` = todas, ou não dá para saber).
+fn colunas_usadas(s: &Selecao, nomes: &[String]) -> Option<Vec<usize>> {
+    let mut v = Vec::new();
+    for item in &s.itens {
+        match item {
+            Item::Tudo => return None,
+            Item::Expr(e, _) => colunas_da_expr(e, nomes, &mut v)?,
+        }
+    }
+    for e in s
+        .onde
+        .iter()
+        .chain(&s.agrupar)
+        .chain(&s.tendo)
+        .chain(s.ordem.iter().map(|(e, _)| e))
+    {
+        colunas_da_expr(e, nomes, &mut v)?;
+    }
+    Some(v)
+}
+
+/// O índice `i` sozinho responde (todas as colunas usadas estão nele ou na chave primária,
+/// nenhuma é REAL, e é o estado atual)?
+fn indice_cobre(t: &Tabela, i: usize, lsn: u64, usadas: Option<&[usize]>) -> bool {
+    let (Some(usadas), Some(idx)) = (usadas, t.def().indices.get(i)) else {
+        return false;
+    };
+    lsn == u64::MAX
+        && usadas.iter().all(|c| {
+            (idx.colunas.contains(c) || t.def().chave.contains(c))
+                && t.def().colunas[*c].tipo != Tipo::Real
+        })
+}
+
+/// Passa cada linha (antes do filtro) para `f`; `f` devolve `false` para parar. Com
+/// `usadas` (as colunas de que quem chama precisa), um índice que cobre todas é lido
+/// sozinho, sem ir à tabela; as outras colunas chegam NULL.
 fn percorrer<P: Paginas + ?Sized>(
     p: &P,
     t: &Tabela,
     acesso: &Acesso,
     lsn: u64,
+    usadas: Option<&[usize]>,
     f: &mut dyn FnMut(Vec<Valor>) -> Resultado<bool>,
 ) -> Resultado<()> {
     match acesso {
+        Acesso::Indice(i, ini, fim) if indice_cobre(t, *i, lsn, usadas) => {
+            let mut v = t.varrer_indice(p, *i, ini.as_deref(), fim.as_deref())?;
+            while let Some(l) = v.proxima()? {
+                if !f(l)? {
+                    break;
+                }
+            }
+        }
         Acesso::Ponto(k) => {
             if let Some(l) = t.obter_por_bytes(p, k, lsn)? {
                 f(l)?;
@@ -229,8 +302,11 @@ fn percorrer<P: Paginas + ?Sized>(
             }
         }
         Acesso::Indice(i, ini, fim) => {
-            for pk in t.buscar_no_indice(p, *i, ini.as_deref(), fim.as_deref())? {
-                if let Some(l) = t.obter_por_bytes(p, &pk, lsn)? {
+            // Cada chave do índice desce a árvore da tabela: lembrar as páginas de cima poupa
+            // o caminho do cache.
+            let lp = siouxdb_transacoes::Lembra::novo(p);
+            for pk in t.buscar_no_indice(&lp, *i, ini.as_deref(), fim.as_deref())? {
+                if let Some(l) = t.obter_por_bytes(&lp, &pk, lsn)? {
                     if !f(l)? {
                         break;
                     }
@@ -255,9 +331,12 @@ fn inteiro_constante(e: &Option<Expr>, params: &[Valor], o_que: &str) -> Resulta
 type Consumidor<'a> = dyn FnMut(Vec<Valor>) -> Resultado<bool> + 'a;
 
 /// Nomes das colunas que a fonte do SELECT entrega (sem ler linha nenhuma).
-fn nomes_da_fonte<P: Paginas + ?Sized>(p: &P, s: &Selecao) -> Resultado<Vec<String>> {
+fn nomes_da_fonte<P: Paginas + ?Sized>(
+    p: &P,
+    s: &Selecao,
+) -> Resultado<(Vec<String>, Option<Tabela>)> {
     let Some(nome) = &s.tabela else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     let sistema = match nome.as_str() {
         "sys_tabelas" => Some(catalogo::colunas_sys_tabelas()),
@@ -266,16 +345,18 @@ fn nomes_da_fonte<P: Paginas + ?Sized>(p: &P, s: &Selecao) -> Resultado<Vec<Stri
         _ => None,
     };
     if let Some(cols) = sistema {
-        return Ok(cols.into_iter().map(|c| c.nome).collect());
+        return Ok((cols.into_iter().map(|c| c.nome).collect(), None));
     }
     if !s.juncoes.is_empty() {
-        return Ok(tabelas_da_juncao(p, s)?
+        let nomes = tabelas_da_juncao(p, s)?
             .iter()
             .flat_map(nomes_qualificados)
-            .collect());
+            .collect();
+        return Ok((nomes, None));
     }
     let t = catalogo::tabela_obrigatoria(p, nome)?;
-    Ok(t.def().colunas.iter().map(|c| c.nome.clone()).collect())
+    let nomes = t.def().colunas.iter().map(|c| c.nome.clone()).collect();
+    Ok((nomes, Some(t)))
 }
 
 /// Fonte de linhas de um SELECT: entrega cada linha (já filtrada pelo WHERE) a `f`, sem
@@ -284,6 +365,7 @@ fn fonte<P: Paginas + ?Sized>(
     p: &P,
     s: &Selecao,
     params: &[Valor],
+    tabela: Option<Tabela>,
     orc: &Orcamento,
     f: &mut Consumidor<'_>,
 ) -> Resultado<String> {
@@ -320,14 +402,27 @@ fn fonte<P: Paginas + ?Sized>(
     if !s.juncoes.is_empty() {
         return fonte_juncao(p, s, params, lsn, orc, f);
     }
-    let t = catalogo::tabela_obrigatoria(p, nome)?;
+    let t = match tabela {
+        Some(t) => t,
+        None => catalogo::tabela_obrigatoria(p, nome)?,
+    };
     let nomes: Vec<String> = t.def().colunas.iter().map(|c| c.nome.clone()).collect();
     if let Some(o) = &s.onde {
         conferir_colunas(o, &nomes, &[])?;
     }
     let acesso = planejar(&t, s.onde.as_ref(), params, lsn);
     let plano = descrever(&acesso, &t);
-    percorrer(p, &t, &acesso, lsn, &mut |l| {
+    let usadas = colunas_usadas(s, &nomes);
+    let plano = if let Acesso::Indice(i, ..) = &acesso {
+        if indice_cobre(&t, *i, lsn, usadas.as_deref()) {
+            format!("{plano} (só o índice)")
+        } else {
+            plano
+        }
+    } else {
+        plano
+    };
+    percorrer(p, &t, &acesso, lsn, usadas.as_deref(), &mut |l| {
         let passou = s.onde.as_ref().map_or(Ok(true), |o| {
             passa(
                 o,
@@ -437,7 +532,7 @@ impl<P: Paginas + ?Sized> Juncao<'_, '_, P> {
         }
         if !sem_par && matches!(acesso, Acesso::Tudo) && n.materializada.is_none() {
             let mut v = Vec::new();
-            percorrer(p, &n.t, &acesso, lsn, &mut |l| {
+            percorrer(p, &n.t, &acesso, lsn, None, &mut |l| {
                 orc.somar(tamanho_linha(&l))?;
                 v.push(l);
                 Ok(true)
@@ -468,7 +563,7 @@ impl<P: Paginas + ?Sized> Juncao<'_, '_, P> {
                 confere(dir)?;
             }
         } else {
-            percorrer(p, &n.t, &acesso, lsn, &mut |dir| confere(&dir))?;
+            percorrer(p, &n.t, &acesso, lsn, None, &mut |dir| confere(&dir))?;
         }
         if saida.is_empty() && n.esquerda {
             let mut combinada = esq.to_vec();
@@ -590,15 +685,17 @@ fn fonte_juncao<P: Paginas + ?Sized>(
             descricao: None,
         });
     }
+    // As buscas na tabela da direita descem sempre pelas mesmas páginas de cima da árvore.
+    let lp = siouxdb_transacoes::Lembra::novo(p);
     let mut j = Juncao {
-        p,
+        p: &lp,
         params,
         lsn,
         orc,
         niveis,
         onde: s.onde.as_ref(),
     };
-    percorrer(p, &t0, &acesso0, lsn, &mut |l| j.juntar(0, l, f))?;
+    percorrer(p, &t0, &acesso0, lsn, None, &mut |l| j.juntar(0, l, f))?;
     for n in &j.niveis {
         plano.push(format!(
             "{}: {}",
@@ -637,6 +734,52 @@ fn ordenar(registros: &mut [(Vec<Valor>, Vec<Valor>)], ordem: &[(Expr, bool)]) {
     });
 }
 
+/// Compara chaves de ordenação pelo ORDER BY; empate fica com quem chegou antes (`seq`).
+fn comparar_chaves(
+    a: &[Valor],
+    seq_a: u64,
+    b: &[Valor],
+    seq_b: u64,
+    ordem: &[(Expr, bool)],
+) -> std::cmp::Ordering {
+    for (i, (_, desc)) in ordem.iter().enumerate() {
+        let o = ordem_total(&a[i], &b[i]);
+        let o = if *desc { o.reverse() } else { o };
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+    }
+    seq_a.cmp(&seq_b)
+}
+
+/// Linha guardada no heap do ORDER BY ... LIMIT (o "maior" é o pior).
+struct Registro<'a> {
+    chave: Vec<Valor>,
+    seq: u64,
+    saida: Vec<Valor>,
+    ordem: &'a [(Expr, bool)],
+}
+
+impl Ord for Registro<'_> {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        comparar_chaves(&self.chave, self.seq, &o.chave, o.seq, self.ordem)
+    }
+}
+
+impl PartialOrd for Registro<'_> {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl PartialEq for Registro<'_> {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Registro<'_> {}
+
 /// Um grupo do GROUP BY: a primeira linha (para colunas fora de agregado) e os acumuladores.
 struct Grupo {
     primeira: Option<Vec<Valor>>,
@@ -655,7 +798,7 @@ fn selecionar<P: Paginas + ?Sized>(
             .any(|i| matches!(i, Item::Expr(e, _) if tem_agregado(e)));
     let limite = inteiro_constante(&s.limite, params, "LIMIT")?;
     let deslocamento = inteiro_constante(&s.deslocamento, params, "OFFSET")?.unwrap_or(0);
-    let nomes = nomes_da_fonte(p, s)?;
+    let (nomes, mut tabela) = nomes_da_fonte(p, s)?;
 
     let mut colunas = Vec::new();
     let mut exprs: Vec<Expr> = Vec::new();
@@ -754,7 +897,7 @@ fn selecionar<P: Paginas + ?Sized>(
                 },
             );
         }
-        plano = fonte(p, s, params, &orc, &mut |l| {
+        plano = fonte(p, s, params, tabela.take(), &orc, &mut |l| {
             let ctx = Ctx {
                 nomes: &nomes,
                 linha: &l,
@@ -821,7 +964,7 @@ fn selecionar<P: Paginas + ?Sized>(
     } else if s.ordem.is_empty() {
         // Sem ordenação: pula o OFFSET, guarda só o que vai para o resultado e para no LIMIT.
         let mut lidas = 0usize;
-        plano = fonte(p, s, params, &orc, &mut |l| {
+        plano = fonte(p, s, params, tabela.take(), &orc, &mut |l| {
             if fim.is_some_and(|f| lidas >= f) {
                 return Ok(false);
             }
@@ -851,34 +994,82 @@ fn selecionar<P: Paginas + ?Sized>(
             plano,
         ));
     } else {
-        // ORDER BY: com LIMIT, guarda só as `OFFSET + LIMIT` melhores (corta de tempos em
-        // tempos); sem LIMIT, o resultado inteiro conta no orçamento.
-        let corte = fim.map(|k| k.saturating_mul(2).max(1024));
-        plano = fonte(p, s, params, &orc, &mut |l| {
+        // ORDER BY. Com LIMIT: um heap com as `OFFSET + LIMIT` melhores; a chave de ordenação
+        // vem antes, e a linha que não entra é descartada sem montar a saída. Sem LIMIT: o
+        // resultado inteiro conta no orçamento.
+        let usa_saida = s.ordem.iter().any(|(e, _)| match e {
+            Expr::Valor(Valor::Inteiro(_)) => true,
+            Expr::Coluna(c) => {
+                colunas.iter().any(|x| x == c) && resolver_coluna(&nomes, c).is_err()
+            }
+            _ => false,
+        });
+        let mut heap: std::collections::BinaryHeap<Registro<'_>> = Default::default();
+        let mut seq = 0u64;
+        plano = fonte(p, s, params, tabela.take(), &orc, &mut |l| {
             let ctx = Ctx {
                 nomes: &nomes,
                 linha: &l,
                 params,
             };
             let valor = |e: &Expr| avaliar(e, &ctx);
-            let saida: Vec<Valor> = exprs.iter().map(valor).collect::<Resultado<_>>()?;
-            let ordem: Vec<Valor> = s
+            let monta_saida = || exprs.iter().map(valor).collect::<Resultado<Vec<Valor>>>();
+            let mut saida = if usa_saida {
+                Some(monta_saida()?)
+            } else {
+                None
+            };
+            let chave: Vec<Valor> = s
                 .ordem
                 .iter()
-                .map(|(e, _)| chave_ordem(&saida, e, &valor))
+                .map(|(e, _)| chave_ordem(saida.as_deref().unwrap_or_default(), e, &valor))
                 .collect::<Resultado<_>>()?;
-            orc.somar(tamanho_linha(&saida) + tamanho_linha(&ordem))?;
-            registros.push((saida, ordem));
-            if let (Some(k), Some(c)) = (fim, corte) {
-                if registros.len() >= c {
-                    ordenar(&mut registros, &s.ordem);
-                    for (a, b) in registros.drain(k..) {
-                        orc.tirar(tamanho_linha(&a) + tamanho_linha(&b));
-                    }
+            seq += 1;
+            let Some(k) = fim else {
+                let saida = match saida.take() {
+                    Some(x) => x,
+                    None => monta_saida()?,
+                };
+                orc.somar(tamanho_linha(&saida) + tamanho_linha(&chave))?;
+                registros.push((saida, chave));
+                return Ok(true);
+            };
+            if k == 0 {
+                return Ok(true);
+            }
+            if heap.len() >= k {
+                let pior = heap.peek().expect("heap cheio");
+                if comparar_chaves(&chave, seq, &pior.chave, pior.seq, &s.ordem)
+                    != std::cmp::Ordering::Less
+                {
+                    return Ok(true);
+                }
+            }
+            let saida = match saida.take() {
+                Some(x) => x,
+                None => monta_saida()?,
+            };
+            orc.somar(tamanho_linha(&saida) + tamanho_linha(&chave))?;
+            heap.push(Registro {
+                chave,
+                seq,
+                saida,
+                ordem: &s.ordem,
+            });
+            if heap.len() > k {
+                if let Some(r) = heap.pop() {
+                    orc.tirar(tamanho_linha(&r.saida) + tamanho_linha(&r.chave));
                 }
             }
             Ok(true)
         })?;
+        if fim.is_some() {
+            registros = heap
+                .into_sorted_vec()
+                .into_iter()
+                .map(|r| (r.saida, r.chave))
+                .collect();
+        }
     }
     if !s.ordem.is_empty() {
         ordenar(&mut registros, &s.ordem);
@@ -978,7 +1169,13 @@ fn chaves_que_casam<P: Paginas + ?Sized>(
     let acesso = planejar(t, onde, params, u64::MAX);
     let orc = Orcamento::novo();
     let mut v = Vec::new();
-    percorrer(p, t, &acesso, u64::MAX, &mut |l| {
+    // Só precisa da chave e das colunas do WHERE (o índice pode bastar).
+    let mut usadas: Vec<usize> = t.def().chave.clone();
+    let usadas = match onde {
+        Some(o) => colunas_da_expr(o, &nomes, &mut usadas).map(|_| usadas),
+        None => Some(usadas),
+    };
+    percorrer(p, t, &acesso, u64::MAX, usadas.as_deref(), &mut |l| {
         let passou = onde.map_or(Ok(true), |o| {
             passa(
                 o,
@@ -1256,8 +1453,28 @@ pub(crate) fn consultar_comando<P: Paginas + ?Sized>(
     }
 }
 
-pub(crate) fn comandos(sql: &str) -> Resultado<Vec<Comando>> {
-    analisar(sql)
+/// Comandos já analisados, pelo texto do SQL (o mesmo texto com parâmetros `?` diferentes
+/// não é analisado de novo, como um comando preparado). Limitado: quando enche, esvazia.
+static ANALISADOS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::sync::Arc<Vec<Comando>>>>,
+> = std::sync::Mutex::new(None);
+const ANALISADOS_MAX: usize = 1024;
+
+pub(crate) fn comandos(sql: &str) -> Resultado<std::sync::Arc<Vec<Comando>>> {
+    {
+        let g = ANALISADOS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.as_ref().and_then(|m| m.get(sql)) {
+            return Ok(std::sync::Arc::clone(c));
+        }
+    }
+    let c = std::sync::Arc::new(analisar(sql)?);
+    let mut g = ANALISADOS.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    if m.len() >= ANALISADOS_MAX {
+        m.clear();
+    }
+    m.insert(sql.to_string(), std::sync::Arc::clone(&c));
+    Ok(c)
 }
 
 /// `VERIFY`: uma linha por item (`item`, `valor`); cada problema vira uma linha `problema`.

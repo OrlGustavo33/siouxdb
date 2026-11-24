@@ -5,7 +5,9 @@
 //! remoção, para o histórico continuar alcançável.
 
 use crate::log::{self, Pontas, Ponteiro};
-use crate::valor::{Tipo, Valor, codificar_chave, codificar_linha, decodificar_linha};
+use crate::valor::{
+    Tipo, Valor, codificar_chave, codificar_linha, decodificar_chave, decodificar_linha,
+};
 use crate::{ErroCatalogo, Resultado};
 use siouxdb_armazenamento::{NumeroPagina, TipoPagina};
 use siouxdb_indices::arvore::{self, Cursor, ResumoArvore};
@@ -439,6 +441,28 @@ impl Tabela {
         Ok(v)
     }
 
+    /// Percorre um índice **sem ir à tabela**: cada linha vem só com as colunas do índice e
+    /// as da chave primária preenchidas (as demais ficam NULL). Vale para o estado atual
+    /// (o índice não guarda histórico).
+    pub fn varrer_indice<'p, P: Paginas + ?Sized>(
+        &'p self,
+        p: &'p P,
+        posicao: usize,
+        inicio: Option<&[u8]>,
+        fim: Option<&[u8]>,
+    ) -> Resultado<VarreduraIndice<'p, P>> {
+        let idx = self
+            .def
+            .indices
+            .get(posicao)
+            .ok_or(ErroCatalogo::Corrompido("índice inexistente"))?;
+        Ok(VarreduraIndice {
+            tabela: self,
+            colunas: &idx.colunas,
+            cursor: Cursor::novo(p, idx.raiz, inicio, fim)?,
+        })
+    }
+
     /// Linha pela chave primária já codificada, como estava no LSN `lsn`.
     pub fn obter_por_bytes<P: Paginas + ?Sized>(
         &self,
@@ -630,7 +654,7 @@ impl Tabela {
         let cursor = Cursor::novo(p, cab.raiz, inicio.as_deref(), fim.as_deref())?;
         Ok(Varredura {
             tabela: self,
-            paginas: p,
+            paginas: siouxdb_transacoes::Lembra::novo(p),
             cursor,
             lsn,
         })
@@ -648,7 +672,7 @@ impl Tabela {
         let cursor = Cursor::novo(p, cab.raiz, inicio, fim)?;
         Ok(Varredura {
             tabela: self,
-            paginas: p,
+            paginas: siouxdb_transacoes::Lembra::novo(p),
             cursor,
             lsn,
         })
@@ -761,7 +785,7 @@ impl Tabela {
 /// Linhas de uma tabela em ordem de chave. Ver [`Tabela::varrer`].
 pub struct Varredura<'p, P: Paginas + ?Sized> {
     tabela: &'p Tabela,
-    paginas: &'p P,
+    paginas: siouxdb_transacoes::Lembra<'p, P>,
     cursor: Cursor<'p, P>,
     lsn: u64,
 }
@@ -770,7 +794,7 @@ impl<P: Paginas + ?Sized> Varredura<'_, P> {
     /// Próxima linha (pula chaves removidas ou que não existiam no LSN pedido).
     pub fn proxima(&mut self) -> Resultado<Option<Vec<Valor>>> {
         while let Some(ponteiro) = self.cursor.proximo_com(|_, v| Ponteiro::de_bytes(v))? {
-            if let Some(linha) = self.tabela.resolver(self.paginas, ponteiro?, self.lsn)? {
+            if let Some(linha) = self.tabela.resolver(&self.paginas, ponteiro?, self.lsn)? {
                 return Ok(Some(linha));
             }
         }
@@ -784,6 +808,33 @@ impl<P: Paginas + ?Sized> Varredura<'_, P> {
             v.push(l);
         }
         Ok(v)
+    }
+}
+
+/// Leitura de um índice sem ir à tabela (veja [`Tabela::varrer_indice`]).
+pub struct VarreduraIndice<'p, P: Paginas + ?Sized> {
+    tabela: &'p Tabela,
+    colunas: &'p [usize],
+    cursor: Cursor<'p, P>,
+}
+
+impl<P: Paginas + ?Sized> VarreduraIndice<'_, P> {
+    /// Próxima linha parcial (colunas do índice e da chave; o resto NULL).
+    pub fn proxima(&mut self) -> Resultado<Option<Vec<Valor>>> {
+        let Some(k) = self.cursor.proximo_com(|k, _| k.to_vec())? else {
+            return Ok(None);
+        };
+        let def = &self.tabela.def;
+        let (valores, resto) = decodificar_chave(&k, self.colunas.len())?;
+        let (pk, _) = decodificar_chave(resto, def.chave.len())?;
+        let mut linha = vec![Valor::Nulo; def.colunas.len()];
+        for (v, &c) in valores.into_iter().zip(self.colunas) {
+            linha[c] = v;
+        }
+        for (v, &c) in pk.into_iter().zip(&def.chave) {
+            linha[c] = v;
+        }
+        Ok(Some(linha))
     }
 }
 

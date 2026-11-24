@@ -849,3 +849,33 @@ fn fator_simulacao() -> u64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
 }
+
+#[test]
+fn chave_decodifica_de_volta() {
+    use crate::Decimal;
+    use crate::valor::{codificar_chave, decodificar_chave};
+    let valores = vec![
+        Valor::Nulo,
+        Valor::Booleano(true),
+        Valor::Inteiro(i64::MIN),
+        Valor::Inteiro(-1),
+        Valor::Inteiro(0),
+        Valor::Inteiro(i64::MAX),
+        Valor::Real(-2.5),
+        Valor::Real(0.0),
+        Valor::Real(1e300),
+        Valor::Real(f64::NEG_INFINITY),
+        Valor::Texto(String::new()),
+        Valor::Texto("a\0b\u{0}\u{0}ção".into()),
+        Valor::Bytes(vec![0, 0, 255, 0]),
+        Valor::Decimal(Decimal::de_bruto(-123_456_789)),
+        Valor::DataHora(-5),
+    ];
+    let k = codificar_chave(&valores).unwrap();
+    let mut mais = k.clone();
+    mais.extend_from_slice(b"resto");
+    let (v, resto) = decodificar_chave(&mais, valores.len()).unwrap();
+    assert_eq!(v, valores);
+    assert_eq!(resto, b"resto");
+    assert!(decodificar_chave(&k[..k.len() - 1], valores.len()).is_err());
+}

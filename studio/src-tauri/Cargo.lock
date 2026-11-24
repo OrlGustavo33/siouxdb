@@ -529,6 +529,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32c"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f132a176423ee852e8f0a35d43088d1850966b50745be818a88b76f64b1c6cb"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3198,6 +3207,7 @@ dependencies = [
 name = "siouxdb-armazenamento"
 version = "0.0.1"
 dependencies = [
+ "crc32c",
  "siouxdb-cripto",
  "siouxdb-metricas",
  "siouxdb-vfs",

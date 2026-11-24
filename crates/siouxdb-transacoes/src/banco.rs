@@ -1128,3 +1128,50 @@ impl<A: Arquivo> PaginasMut for Transacao<'_, A> {
         Transacao::definir_raiz_catalogo(self, numero);
     }
 }
+
+/// Leitor que lembra as últimas páginas lidas. Numa varredura, linhas vizinhas moram na
+/// mesma página: lembrar evita o caminho do cache (cadeados e buscas) a cada linha. Só vive
+/// enquanto empresta a foto (ou a transação) sem alterá-la, então nunca fica desatualizado.
+pub struct Lembra<'p, P: Paginas + ?Sized> {
+    p: &'p P,
+    ultimas: std::cell::RefCell<[(NumeroPagina, Option<Arc<Pagina>>); 4]>,
+    proxima: std::cell::Cell<usize>,
+}
+
+impl<'p, P: Paginas + ?Sized> Lembra<'p, P> {
+    /// Sobre uma foto ou transação.
+    pub fn novo(p: &'p P) -> Self {
+        Lembra {
+            p,
+            ultimas: Default::default(),
+            proxima: Default::default(),
+        }
+    }
+}
+
+impl<P: Paginas + ?Sized> Paginas for Lembra<'_, P> {
+    fn pagina(&self, numero: NumeroPagina) -> Resultado<Arc<Pagina>> {
+        if let Some(pg) = self
+            .ultimas
+            .borrow()
+            .iter()
+            .find(|(n, pg)| *n == numero && pg.is_some())
+            .and_then(|(_, pg)| pg.clone())
+        {
+            return Ok(pg);
+        }
+        let pg = self.p.pagina(numero)?;
+        let i = self.proxima.get();
+        self.ultimas.borrow_mut()[i] = (numero, Some(Arc::clone(&pg)));
+        self.proxima.set((i + 1) % 4);
+        Ok(pg)
+    }
+
+    fn meta(&self) -> Meta {
+        self.p.meta()
+    }
+
+    fn tamanho_conteudo(&self) -> usize {
+        self.p.tamanho_conteudo()
+    }
+}
