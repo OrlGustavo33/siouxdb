@@ -1396,3 +1396,87 @@ fn verify_confere_o_razao_e_a_ancora() {
     assert_eq!(item(&r, "resultado"), v("FALHOU"), "{r:?}");
     assert!(matches!(erro(&b, "VERIFY 'lixo'"), ErroSql::Semantica(_)));
 }
+
+#[test]
+fn consultas_respeitam_o_limite_de_memoria() {
+    use crate::com_limite_memoria;
+    let (_vfs, b) = banco();
+    exec(
+        &b,
+        "CREATE TABLE m (id INTEIRO PRIMARY KEY, g INTEIRO, v INTEIRO, txt TEXTO)",
+        &[],
+    );
+    let n = 20_000i64;
+    let texto = "x".repeat(200);
+    let mut tx = b.escrever().unwrap();
+    for i in 0..n {
+        executar(
+            &mut tx,
+            "INSERT INTO m VALUES (?, ?, ?, ?)",
+            &[v(i), v(i % 10), v((i * 7919) % n), v(texto.as_str())],
+        )
+        .unwrap();
+    }
+    tx.confirmar().unwrap();
+    // ~6 MiB de linhas; limite de 2 MiB.
+    com_limite_memoria(2 << 20, || {
+        let l = b.ler().unwrap();
+        let tudo = consultar(&l, "SELECT * FROM m", &[]);
+        assert!(
+            matches!(tudo, Err(ErroSql::MemoriaEsgotada { .. })),
+            "{tudo:?}"
+        );
+        // LIMIT para cedo.
+        let r = consultar(&l, "SELECT id FROM m LIMIT 5 OFFSET 3", &[]).unwrap();
+        assert_eq!(r.linhas, (3..8).map(|i| vec![v(i)]).collect::<Vec<_>>());
+        // ORDER BY + LIMIT guarda só as melhores.
+        let r = consultar(
+            &l,
+            "SELECT v, id FROM m ORDER BY v DESC LIMIT 4 OFFSET 1",
+            &[],
+        )
+        .unwrap();
+        let mut todos: Vec<(i64, i64)> = (0..n).map(|i| ((i * 7919) % n, i)).collect();
+        todos.sort_by(|a, b| b.0.cmp(&a.0));
+        let esperado: Vec<Vec<Valor>> =
+            todos[1..5].iter().map(|&(x, i)| vec![v(x), v(i)]).collect();
+        assert_eq!(r.linhas, esperado);
+        // GROUP BY com acumuladores (os grupos não guardam linhas).
+        let r = consultar(
+            &l,
+            "SELECT g, COUNT(*), SUM(id), MIN(v), MAX(txt), AVG(id) FROM m GROUP BY g ORDER BY g",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(r.linhas.len(), 10);
+        for (g, linha) in r.linhas.iter().enumerate() {
+            let ids: Vec<i64> = (0..n).filter(|i| i % 10 == g as i64).collect();
+            let soma: i64 = ids.iter().sum();
+            let min = ids.iter().map(|i| (i * 7919) % n).min().unwrap();
+            assert_eq!(linha[0], v(g as i64));
+            assert_eq!(linha[1], v(ids.len() as i64));
+            assert_eq!(linha[2], v(soma));
+            assert_eq!(linha[3], v(min));
+            assert_eq!(linha[4], v(texto.as_str()));
+            assert_eq!(linha[5], Valor::Real(soma as f64 / ids.len() as f64));
+        }
+        // JOIN em fluxo (a direita usa a chave; nada materializado).
+        let r = consultar(
+            &l,
+            "SELECT a.id, b.id FROM m a JOIN m b ON b.id = a.v WHERE a.id < 3",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(r.linhas.len(), 3);
+        drop(l);
+        // UPDATE e DELETE guardam só as chaves.
+        let mut tx = b.escrever().unwrap();
+        let s = executar(&mut tx, "UPDATE m SET v = v + 1 WHERE g < 5", &[]).unwrap();
+        assert_eq!(s[0].afetadas, (n / 2) as u64);
+        let s = executar(&mut tx, "DELETE FROM m WHERE g >= 5", &[]).unwrap();
+        assert_eq!(s[0].afetadas, (n / 2) as u64);
+        tx.confirmar().unwrap();
+    });
+    assert_eq!(q(&b, "SELECT COUNT(*) FROM m", &[]), vec![vec![v(n / 2)]]);
+    assert_eq!(q(&b, "SELECT v FROM m WHERE id = 0", &[]), vec![vec![v(1)]]);
+}

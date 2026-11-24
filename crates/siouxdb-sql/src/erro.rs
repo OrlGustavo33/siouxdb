@@ -18,6 +18,12 @@ pub enum ErroSql {
     Semantica(String),
     /// Erro das tabelas, índices ou do banco.
     Catalogo(ErroCatalogo),
+    /// A consulta precisou guardar mais que o limite de memória
+    /// ([`definir_limite_memoria`](crate::definir_limite_memoria)).
+    MemoriaEsgotada {
+        /// O limite, em bytes.
+        limite: usize,
+    },
 }
 
 impl fmt::Display for ErroSql {
@@ -28,6 +34,12 @@ impl fmt::Display for ErroSql {
             }
             ErroSql::Semantica(m) => write!(f, "{m}"),
             ErroSql::Catalogo(e) => write!(f, "{e}"),
+            ErroSql::MemoriaEsgotada { limite } => write!(
+                f,
+                "a consulta passou do limite de memória ({} MiB): use LIMIT, um WHERE mais \
+                 restrito ou um índice que sirva ao ORDER BY",
+                limite >> 20
+            ),
         }
     }
 }

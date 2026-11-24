@@ -428,95 +428,141 @@ fn funcao(nome: &str, v: Vec<Valor>) -> Resultado<Valor> {
     })
 }
 
-/// Troca cada agregado pelo valor dele calculado sobre as linhas do grupo.
-pub(crate) fn resolver_agregados(
-    e: &Expr,
-    nomes: &[String],
-    linhas: &[Vec<Valor>],
-    params: &[Valor],
-) -> Resultado<Expr> {
-    let r = |x: &Expr| resolver_agregados(x, nomes, linhas, params);
-    Ok(match e {
+/// Junta em `molde` (sem repetir) os agregados que aparecem em `e`, conferindo o uso.
+pub(crate) fn coletar_agregados(e: &Expr, molde: &mut Vec<Expr>) -> Resultado<()> {
+    let mut r = |x: &Expr| coletar_agregados(x, molde);
+    match e {
         Expr::Funcao(n, args, estrela) if AGREGADOS.contains(&n.as_str()) => {
-            if *estrela {
-                if n != "count" {
-                    return semantica(format!("{}(*) não existe; use COUNT(*)", n.to_uppercase()));
-                }
-                return Ok(Expr::Valor(Valor::Inteiro(linhas.len() as i64)));
+            if *estrela && n != "count" {
+                return semantica(format!("{}(*) não existe; use COUNT(*)", n.to_uppercase()));
             }
-            if args.len() != 1 {
+            if !*estrela && args.len() != 1 {
                 return semantica(format!("{}() recebe 1 argumento", n.to_uppercase()));
             }
-            let mut valores = Vec::with_capacity(linhas.len());
-            for l in linhas {
-                let v = avaliar(
-                    &args[0],
-                    &Ctx {
-                        nomes,
-                        linha: l,
-                        params,
-                    },
-                )?;
-                if !matches!(v, Valor::Nulo) {
-                    valores.push(v);
-                }
+            if !*estrela && tem_agregado(&args[0]) {
+                return semantica("agregado dentro de agregado não é permitido");
             }
-            Expr::Valor(agregar(n, valores)?)
+            if !molde.contains(e) {
+                molde.push(e.clone());
+            }
         }
-        Expr::Funcao(n, args, estrela) => Expr::Funcao(
-            n.clone(),
-            args.iter().map(r).collect::<Resultado<_>>()?,
-            *estrela,
-        ),
-        Expr::Nao(a) => Expr::Nao(Box::new(r(a)?)),
-        Expr::Negativo(a) => Expr::Negativo(Box::new(r(a)?)),
-        Expr::EhNulo(a, n) => Expr::EhNulo(Box::new(r(a)?), *n),
-        Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(r(a)?), Box::new(r(b)?)),
-        Expr::Como(a, b, n) => Expr::Como(Box::new(r(a)?), Box::new(r(b)?), *n),
-        Expr::Em(a, l, n) => Expr::Em(
-            Box::new(r(a)?),
-            l.iter().map(r).collect::<Resultado<_>>()?,
-            *n,
-        ),
-        Expr::Entre(a, b, c, n) => {
-            Expr::Entre(Box::new(r(a)?), Box::new(r(b)?), Box::new(r(c)?), *n)
+        Expr::Funcao(_, args, _) => args.iter().try_for_each(r)?,
+        Expr::Nao(a) | Expr::Negativo(a) | Expr::EhNulo(a, _) => r(a)?,
+        Expr::Bin(_, a, b) | Expr::Como(a, b, _) => {
+            r(a)?;
+            r(b)?;
         }
-        outro => outro.clone(),
-    })
+        Expr::Em(a, l, _) => {
+            r(a)?;
+            l.iter().try_for_each(r)?;
+        }
+        Expr::Entre(a, b, c, _) => {
+            r(a)?;
+            r(b)?;
+            r(c)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
-fn agregar(nome: &str, v: Vec<Valor>) -> Resultado<Valor> {
-    if nome == "count" {
-        return Ok(Valor::Inteiro(v.len() as i64));
+/// Estado de um agregado num grupo: soma, conta, mínimo ou máximo, linha a linha (o grupo
+/// nunca guarda as linhas).
+#[derive(Debug, Clone)]
+pub(crate) struct Acumulador {
+    nome: String,
+    arg: Option<Expr>,
+    n: i64,
+    valor: Option<Valor>,
+}
+
+impl Acumulador {
+    /// Para um agregado do molde.
+    pub(crate) fn novo(e: &Expr) -> Acumulador {
+        let (nome, arg) = match e {
+            Expr::Funcao(n, args, estrela) => (n.clone(), (!*estrela).then(|| args[0].clone())),
+            _ => (String::new(), None),
+        };
+        Acumulador {
+            nome,
+            arg,
+            n: 0,
+            valor: None,
+        }
     }
-    if v.is_empty() {
-        return Ok(Valor::Nulo);
-    }
-    Ok(match nome {
-        "min" | "max" => {
-            let mut m = v[0].clone();
-            for x in &v[1..] {
-                let o = comparar(x, &m)?.unwrap_or(Ordering::Equal);
-                if (nome == "min" && o == Ordering::Less)
-                    || (nome == "max" && o == Ordering::Greater)
-                {
-                    m = x.clone();
+
+    /// Conta mais uma linha.
+    pub(crate) fn somar(&mut self, ctx: &Ctx<'_>) -> Resultado<()> {
+        let Some(arg) = &self.arg else {
+            self.n += 1;
+            return Ok(());
+        };
+        let v = avaliar(arg, ctx)?;
+        if matches!(v, Valor::Nulo) {
+            return Ok(());
+        }
+        self.n += 1;
+        match self.nome.as_str() {
+            "count" => {}
+            "min" | "max" => {
+                let troca = match &self.valor {
+                    None => true,
+                    Some(m) => {
+                        let o = comparar(&v, m)?.unwrap_or(Ordering::Equal);
+                        (self.nome == "min" && o == Ordering::Less)
+                            || (self.nome == "max" && o == Ordering::Greater)
+                    }
+                };
+                if troca {
+                    self.valor = Some(v);
                 }
             }
-            m
-        }
-        _ => {
-            let mut soma = Valor::Inteiro(0);
-            for x in &v {
-                soma = numerico(Op::Mais, &soma, x)?;
-            }
-            if nome == "avg" {
-                numerico(Op::Dividir, &soma, &Valor::Real(v.len() as f64))?
-            } else {
-                soma
+            _ => {
+                let soma = self.valor.take().unwrap_or(Valor::Inteiro(0));
+                self.valor = Some(numerico(Op::Mais, &soma, &v)?);
             }
         }
-    })
+        Ok(())
+    }
+
+    /// Valor final.
+    pub(crate) fn resultado(&self) -> Resultado<Valor> {
+        if self.nome == "count" {
+            return Ok(Valor::Inteiro(self.n));
+        }
+        let Some(v) = &self.valor else {
+            return Ok(Valor::Nulo);
+        };
+        if self.nome == "avg" {
+            numerico(Op::Dividir, v, &Valor::Real(self.n as f64))
+        } else {
+            Ok(v.clone())
+        }
+    }
+}
+
+/// Troca cada agregado de `e` pelo valor calculado (na mesma posição do `molde`).
+pub(crate) fn trocar_agregados(e: &Expr, molde: &[Expr], valores: &[Valor]) -> Expr {
+    let r = |x: &Expr| trocar_agregados(x, molde, valores);
+    match e {
+        Expr::Funcao(n, _, _) if AGREGADOS.contains(&n.as_str()) => molde
+            .iter()
+            .position(|m| m == e)
+            .map_or(Expr::Valor(Valor::Nulo), |i| {
+                Expr::Valor(valores[i].clone())
+            }),
+        Expr::Funcao(n, args, estrela) => {
+            Expr::Funcao(n.clone(), args.iter().map(r).collect(), *estrela)
+        }
+        Expr::Nao(a) => Expr::Nao(Box::new(r(a))),
+        Expr::Negativo(a) => Expr::Negativo(Box::new(r(a))),
+        Expr::EhNulo(a, n) => Expr::EhNulo(Box::new(r(a)), *n),
+        Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(r(a)), Box::new(r(b))),
+        Expr::Como(a, b, n) => Expr::Como(Box::new(r(a)), Box::new(r(b)), *n),
+        Expr::Em(a, l, n) => Expr::Em(Box::new(r(a)), l.iter().map(r).collect(), *n),
+        Expr::Entre(a, b, c, n) => Expr::Entre(Box::new(r(a)), Box::new(r(b)), Box::new(r(c)), *n),
+        outro => outro.clone(),
+    }
 }
 
 #[cfg(test)]

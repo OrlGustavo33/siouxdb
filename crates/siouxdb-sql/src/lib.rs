@@ -26,9 +26,11 @@ mod avaliar;
 mod erro;
 mod executor;
 mod lexico;
+mod memoria;
 mod parser;
 
 pub use erro::{ErroSql, Resultado};
+pub use memoria::{LIMITE_PADRAO, com_limite_memoria, definir_limite_memoria, limite_memoria};
 use siouxdb_catalogo::Valor;
 use siouxdb_transacoes::{Paginas, PaginasMut};
 

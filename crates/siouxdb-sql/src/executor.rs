@@ -1,10 +1,11 @@
 //! Planejador simples e execução.
 
 use crate::avaliar::{
-    Ctx, avaliar, conferir_colunas, decimal_de, ordem_total, passa, resolver_agregados,
-    resolver_coluna, tem_agregado, tem_coluna,
+    Acumulador, Ctx, avaliar, coletar_agregados, conferir_colunas, decimal_de, ordem_total, passa,
+    resolver_coluna, tem_agregado, tem_coluna, trocar_agregados,
 };
 use crate::erro::{ErroSql, semantica};
+use crate::memoria::{Orcamento, tamanho_linha};
 use crate::parser::{ColDef, Comando, Conflito, Expr, Item, Op, Selecao, analisar};
 use crate::{Resultado, Saida};
 use siouxdb_catalogo::catalogo;
@@ -250,16 +251,46 @@ fn inteiro_constante(e: &Option<Expr>, params: &[Valor], o_que: &str) -> Resulta
     }
 }
 
-/// Fonte de linhas de um SELECT: nomes das colunas e as linhas (já filtradas).
+/// Quem recebe as linhas de uma fonte, uma por vez; devolve `false` para parar.
+type Consumidor<'a> = dyn FnMut(Vec<Valor>) -> Resultado<bool> + 'a;
+
+/// Nomes das colunas que a fonte do SELECT entrega (sem ler linha nenhuma).
+fn nomes_da_fonte<P: Paginas + ?Sized>(p: &P, s: &Selecao) -> Resultado<Vec<String>> {
+    let Some(nome) = &s.tabela else {
+        return Ok(Vec::new());
+    };
+    let sistema = match nome.as_str() {
+        "sys_tabelas" => Some(catalogo::colunas_sys_tabelas()),
+        "sys_colunas" => Some(catalogo::colunas_sys_colunas()),
+        "sys_indices" => Some(catalogo::colunas_sys_indices()),
+        _ => None,
+    };
+    if let Some(cols) = sistema {
+        return Ok(cols.into_iter().map(|c| c.nome).collect());
+    }
+    if !s.juncoes.is_empty() {
+        return Ok(tabelas_da_juncao(p, s)?
+            .iter()
+            .flat_map(nomes_qualificados)
+            .collect());
+    }
+    let t = catalogo::tabela_obrigatoria(p, nome)?;
+    Ok(t.def().colunas.iter().map(|c| c.nome.clone()).collect())
+}
+
+/// Fonte de linhas de um SELECT: entrega cada linha (já filtrada pelo WHERE) a `f`, sem
+/// juntar nada na memória. Devolve o plano.
 fn fonte<P: Paginas + ?Sized>(
     p: &P,
     s: &Selecao,
     params: &[Valor],
-    parar_em: Option<usize>,
-) -> Resultado<(Vec<String>, Vec<Vec<Valor>>, String)> {
+    orc: &Orcamento,
+    f: &mut Consumidor<'_>,
+) -> Resultado<String> {
     let lsn = inteiro_constante(&s.como_estava, params, "AS OF")?.unwrap_or(u64::MAX);
     let Some(nome) = &s.tabela else {
-        return Ok((Vec::new(), vec![Vec::new()], "sem tabela".into()));
+        f(Vec::new())?;
+        return Ok("sem tabela".into());
     };
     let sistema = match nome.as_str() {
         "sys_tabelas" => Some((catalogo::colunas_sys_tabelas(), catalogo::sys_tabelas(p)?)),
@@ -269,9 +300,8 @@ fn fonte<P: Paginas + ?Sized>(
     };
     if let Some((cols, linhas)) = sistema {
         let nomes: Vec<String> = cols.into_iter().map(|c| c.nome).collect();
-        let mut v = Vec::new();
         for l in linhas {
-            if s.onde.as_ref().map_or(Ok(true), |o| {
+            let passou = s.onde.as_ref().map_or(Ok(true), |o| {
                 passa(
                     o,
                     &Ctx {
@@ -280,14 +310,15 @@ fn fonte<P: Paginas + ?Sized>(
                         params,
                     },
                 )
-            })? {
-                v.push(l);
+            })?;
+            if passou && !f(l)? {
+                break;
             }
         }
-        return Ok((nomes, v, "tabela do sistema".into()));
+        return Ok("tabela do sistema".into());
     }
     if !s.juncoes.is_empty() {
-        return fonte_juncao(p, s, params, lsn);
+        return fonte_juncao(p, s, params, lsn, orc, f);
     }
     let t = catalogo::tabela_obrigatoria(p, nome)?;
     let nomes: Vec<String> = t.def().colunas.iter().map(|c| c.nome.clone()).collect();
@@ -296,10 +327,8 @@ fn fonte<P: Paginas + ?Sized>(
     }
     let acesso = planejar(&t, s.onde.as_ref(), params, lsn);
     let plano = descrever(&acesso, &t);
-    let mut linhas = Vec::new();
-    let mut erro = None;
     percorrer(p, &t, &acesso, lsn, &mut |l| {
-        match s.onde.as_ref().map_or(Ok(true), |o| {
+        let passou = s.onde.as_ref().map_or(Ok(true), |o| {
             passa(
                 o,
                 &Ctx {
@@ -308,31 +337,14 @@ fn fonte<P: Paginas + ?Sized>(
                     params,
                 },
             )
-        }) {
-            Ok(true) => linhas.push(l),
-            Ok(false) => {}
-            Err(e) => {
-                erro = Some(e);
-                return Ok(false);
-            }
-        }
-        Ok(parar_em.is_none_or(|n| linhas.len() < n))
+        })?;
+        if passou { f(l) } else { Ok(true) }
     })?;
-    if let Some(e) = erro {
-        return Err(e);
-    }
-    Ok((nomes, linhas, plano))
+    Ok(plano)
 }
 
-/// SELECT com JOIN: laço aninhado, com busca pela chave ou índice na tabela da direita
-/// quando o ON tem `direita.coluna = <algo da esquerda>`; o ON completo e o WHERE são
-/// sempre reaplicados, então o plano só muda a velocidade.
-fn fonte_juncao<P: Paginas + ?Sized>(
-    p: &P,
-    s: &Selecao,
-    params: &[Valor],
-    lsn: u64,
-) -> Resultado<(Vec<String>, Vec<Vec<Valor>>, String)> {
+/// Tabelas de um SELECT com JOIN, com o nome visível (apelido ou nome) de cada uma.
+fn tabelas_da_juncao<P: Paginas + ?Sized>(p: &P, s: &Selecao) -> Resultado<Vec<(String, Tabela)>> {
     let nome0 = s.tabela.as_deref().unwrap_or_default();
     let mut tabelas: Vec<(String, Tabela)> = Vec::new();
     let mut declaradas = vec![(nome0, s.apelido.as_deref())];
@@ -355,21 +367,170 @@ fn fonte_juncao<P: Paginas + ?Sized>(
         }
         tabelas.push((visivel, catalogo::tabela_obrigatoria(p, nome)?));
     }
-    let nomes_de = |(alias, t): &(String, Tabela)| -> Vec<String> {
-        t.def()
-            .colunas
-            .iter()
-            .map(|c| format!("{alias}.{}", c.nome))
-            .collect()
-    };
-    let todos: Vec<String> = tabelas.iter().flat_map(nomes_de).collect();
+    Ok(tabelas)
+}
+
+fn nomes_qualificados((alias, t): &(String, Tabela)) -> Vec<String> {
+    t.def()
+        .colunas
+        .iter()
+        .map(|c| format!("{alias}.{}", c.nome))
+        .collect()
+}
+
+/// Um JOIN da consulta (a tabela da direita e como ligar).
+struct Nivel<'s> {
+    alias: String,
+    t: Tabela,
+    on: &'s Expr,
+    esquerda: bool,
+    /// Colunas da esquerda + desta tabela.
+    juntos: Vec<String>,
+    largura_esquerda: usize,
+    /// `direita.coluna = <expressão da esquerda>` tiradas do ON.
+    ligacoes: Vec<(usize, &'s Expr)>,
+    /// A tabela inteira, quando não há busca possível (lida uma vez só).
+    materializada: Option<Vec<Vec<Valor>>>,
+    descricao: Option<String>,
+}
+
+/// Laço aninhado em fluxo: cada linha da esquerda desce pelos JOINs e, se passar no
+/// WHERE, vai direto para quem consome. Só a tabela da direita sem busca fica na memória.
+struct Juncao<'a, 's, P: ?Sized> {
+    p: &'a P,
+    params: &'a [Valor],
+    lsn: u64,
+    orc: &'a Orcamento,
+    niveis: Vec<Nivel<'s>>,
+    onde: Option<&'s Expr>,
+}
+
+impl<P: Paginas + ?Sized> Juncao<'_, '_, P> {
+    /// Linhas combinadas (esquerda + direita) que passam no ON do nível `k`.
+    fn pares(&mut self, k: usize, esq: &[Valor]) -> Resultado<Vec<Vec<Valor>>> {
+        let (p, params, lsn, orc) = (self.p, self.params, self.lsn, self.orc);
+        let n = &mut self.niveis[k];
+        let ctx = Ctx {
+            nomes: &n.juntos[..n.largura_esquerda],
+            linha: esq,
+            params,
+        };
+        let mut preds = Vec::new();
+        // Igualdade com NULL nunca é verdadeira: essa linha não casa com nada.
+        let mut sem_par = false;
+        for (i, e) in &n.ligacoes {
+            if let Ok(v) = avaliar(e, &ctx) {
+                if matches!(v, Valor::Nulo) {
+                    sem_par = true;
+                } else if let Some(v) = no_tipo(v, n.t.def().colunas[*i].tipo) {
+                    preds.push((*i, Op::Igual, v));
+                }
+            }
+        }
+        let acesso = if sem_par {
+            Acesso::Ponto(Vec::new())
+        } else {
+            planejar_preds(&n.t, preds, lsn)
+        };
+        if !sem_par && !matches!(acesso, Acesso::Tudo) && n.descricao.is_none() {
+            n.descricao = Some(descrever(&acesso, &n.t));
+        }
+        if !sem_par && matches!(acesso, Acesso::Tudo) && n.materializada.is_none() {
+            let mut v = Vec::new();
+            percorrer(p, &n.t, &acesso, lsn, &mut |l| {
+                orc.somar(tamanho_linha(&l))?;
+                v.push(l);
+                Ok(true)
+            })?;
+            n.materializada = Some(v);
+        }
+        let mut saida = Vec::new();
+        let (on, juntos) = (n.on, &n.juntos);
+        let mut confere = |dir: &[Valor]| -> Resultado<bool> {
+            let mut combinada = esq.to_vec();
+            combinada.extend_from_slice(dir);
+            if passa(
+                on,
+                &Ctx {
+                    nomes: juntos,
+                    linha: &combinada,
+                    params,
+                },
+            )? {
+                saida.push(combinada);
+            }
+            Ok(true)
+        };
+        if sem_par {
+            // nada a procurar
+        } else if matches!(acesso, Acesso::Tudo) {
+            for dir in n.materializada.as_deref().unwrap_or_default() {
+                confere(dir)?;
+            }
+        } else {
+            percorrer(p, &n.t, &acesso, lsn, &mut |dir| confere(&dir))?;
+        }
+        if saida.is_empty() && n.esquerda {
+            let mut combinada = esq.to_vec();
+            combinada.extend(std::iter::repeat_n(
+                Valor::Nulo,
+                n.juntos.len() - n.largura_esquerda,
+            ));
+            saida.push(combinada);
+        }
+        Ok(saida)
+    }
+
+    fn juntar(&mut self, k: usize, linha: Vec<Valor>, f: &mut Consumidor<'_>) -> Resultado<bool> {
+        if k == self.niveis.len() {
+            if let Some(o) = self.onde {
+                let nomes = self
+                    .niveis
+                    .last()
+                    .map(|n| n.juntos.as_slice())
+                    .unwrap_or_default();
+                if !passa(
+                    o,
+                    &Ctx {
+                        nomes,
+                        linha: &linha,
+                        params: self.params,
+                    },
+                )? {
+                    return Ok(true);
+                }
+            }
+            return f(linha);
+        }
+        for par in self.pares(k, &linha)? {
+            if !self.juntar(k + 1, par, f)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// SELECT com JOIN: laço aninhado, com busca pela chave ou índice na tabela da direita
+/// quando o ON tem `direita.coluna = <algo da esquerda>`; o ON completo e o WHERE são
+/// sempre reaplicados, então o plano só muda a velocidade.
+fn fonte_juncao<P: Paginas + ?Sized>(
+    p: &P,
+    s: &Selecao,
+    params: &[Valor],
+    lsn: u64,
+    orc: &Orcamento,
+    f: &mut Consumidor<'_>,
+) -> Resultado<String> {
+    let mut tabelas = tabelas_da_juncao(p, s)?;
+    let todos: Vec<String> = tabelas.iter().flat_map(nomes_qualificados).collect();
     if let Some(o) = &s.onde {
         conferir_colunas(o, &todos, &[])?;
     }
 
     // Tabela da esquerda: o planejador pode usar os predicados do WHERE que são só dela.
-    let (alias0, t0) = &tabelas[0];
-    let outros: Vec<String> = tabelas[1..].iter().flat_map(nomes_de).collect();
+    let (alias0, t0) = tabelas.remove(0);
+    let outros: Vec<String> = tabelas.iter().flat_map(nomes_qualificados).collect();
     let posicao0 = |c: &str| -> Option<usize> {
         match c.rsplit_once('.') {
             Some((q, r)) if q == alias0 => t0.def().colunas.iter().position(|x| x.nome == r),
@@ -383,20 +544,19 @@ fn fonte_juncao<P: Paginas + ?Sized>(
             None => t0.def().colunas.iter().position(|x| x.nome == c),
         }
     };
-    let acesso0 = planejar_preds(t0, predicados(t0, s.onde.as_ref(), params, &posicao0), lsn);
-    let mut plano = vec![format!("{alias0}: {}", descrever(&acesso0, t0))];
-    let mut linhas: Vec<Vec<Valor>> = Vec::new();
-    percorrer(p, t0, &acesso0, lsn, &mut |l| {
-        linhas.push(l);
-        Ok(true)
-    })?;
-    let mut nomes = nomes_de(&tabelas[0]);
+    let acesso0 = planejar_preds(
+        &t0,
+        predicados(&t0, s.onde.as_ref(), params, &posicao0),
+        lsn,
+    );
+    let mut plano = vec![format!("{alias0}: {}", descrever(&acesso0, &t0))];
 
-    for (k, j) in s.juncoes.iter().enumerate() {
-        let (alias, t) = &tabelas[k + 1];
-        let nomes_direita = nomes_de(&tabelas[k + 1]);
+    let mut nomes = nomes_qualificados(&(alias0.clone(), t0.clone()));
+    let mut niveis = Vec::new();
+    for (j, (alias, t)) in s.juncoes.iter().zip(tabelas) {
+        let largura_esquerda = nomes.len();
         let mut juntos = nomes.clone();
-        juntos.extend(nomes_direita.iter().cloned());
+        juntos.extend(nomes_qualificados(&(alias.clone(), t.clone())));
         conferir_colunas(&j.on, &juntos, &[])?;
         // Igualdades `direita.col = expr da esquerda` do ON: delas sai a busca.
         let mut ligacoes: Vec<(usize, &Expr)> = Vec::new();
@@ -406,124 +566,47 @@ fn fonte_juncao<P: Paginas + ?Sized>(
                     if let Expr::Coluna(nome) = &**lado {
                         let i = resolver_coluna(&juntos, nome)
                             .ok()
-                            .filter(|i| *i >= nomes.len());
+                            .filter(|i| *i >= largura_esquerda);
                         if let Some(i) = i {
                             if conferir_colunas(outro, &nomes, &[]).is_ok() && !tem_agregado(outro)
                             {
-                                ligacoes.push((i - nomes.len(), outro));
+                                ligacoes.push((i - largura_esquerda, &**outro));
                             }
                         }
                     }
                 }
             }
         }
-        let largura_direita = t.def().colunas.len();
-        let mut materializada: Option<Vec<Vec<Valor>>> = None;
-        let mut descricao = None;
-        let mut novas = Vec::new();
-        for esq in &linhas {
-            let ctx = Ctx {
-                nomes: &nomes,
-                linha: esq,
-                params,
-            };
-            let mut preds = Vec::new();
-            // Igualdade com NULL nunca é verdadeira: essa linha não casa com nada.
-            let mut sem_par = false;
-            for (i, e) in &ligacoes {
-                if let Ok(v) = avaliar(e, &ctx) {
-                    if matches!(v, Valor::Nulo) {
-                        sem_par = true;
-                    } else if let Some(v) = no_tipo(v, t.def().colunas[*i].tipo) {
-                        preds.push((*i, Op::Igual, v));
-                    }
-                }
-            }
-            let acesso = if sem_par {
-                Acesso::Ponto(Vec::new())
-            } else {
-                planejar_preds(t, preds, lsn)
-            };
-            if !matches!(acesso, Acesso::Tudo | Acesso::Ponto(_))
-                || (!sem_par && matches!(acesso, Acesso::Ponto(_)))
-            {
-                descricao.get_or_insert_with(|| descrever(&acesso, t));
-            }
-            let mut achou = false;
-            let mut erro = None;
-            let mut confere = |dir: &[Valor]| {
-                let mut combinada = esq.clone();
-                combinada.extend_from_slice(dir);
-                match passa(
-                    &j.on,
-                    &Ctx {
-                        nomes: &juntos,
-                        linha: &combinada,
-                        params,
-                    },
-                ) {
-                    Ok(true) => {
-                        achou = true;
-                        novas.push(combinada);
-                    }
-                    Ok(false) => {}
-                    Err(e) => erro = Some(e),
-                }
-                erro.is_none()
-            };
-            if sem_par {
-                // nada a procurar
-            } else if matches!(acesso, Acesso::Tudo) {
-                // Sem busca possível: lê a tabela da direita uma vez só.
-                if materializada.is_none() {
-                    let mut v = Vec::new();
-                    percorrer(p, t, &acesso, lsn, &mut |l| {
-                        v.push(l);
-                        Ok(true)
-                    })?;
-                    materializada = Some(v);
-                }
-                for dir in materializada.as_deref().unwrap_or_default() {
-                    if !confere(dir) {
-                        break;
-                    }
-                }
-            } else {
-                percorrer(p, t, &acesso, lsn, &mut |dir| Ok(confere(&dir)))?;
-            }
-            if let Some(e) = erro {
-                return Err(e);
-            }
-            if !achou && j.esquerda {
-                let mut combinada = esq.clone();
-                combinada.extend(std::iter::repeat_n(Valor::Nulo, largura_direita));
-                novas.push(combinada);
-            }
-        }
+        nomes = juntos.clone();
+        niveis.push(Nivel {
+            alias,
+            t,
+            on: &j.on,
+            esquerda: j.esquerda,
+            juntos,
+            largura_esquerda,
+            ligacoes,
+            materializada: None,
+            descricao: None,
+        });
+    }
+    let mut j = Juncao {
+        p,
+        params,
+        lsn,
+        orc,
+        niveis,
+        onde: s.onde.as_ref(),
+    };
+    percorrer(p, &t0, &acesso0, lsn, &mut |l| j.juntar(0, l, f))?;
+    for n in &j.niveis {
         plano.push(format!(
-            "{alias}: {}",
-            descricao.unwrap_or_else(|| "varredura completa".into())
+            "{}: {}",
+            n.alias,
+            n.descricao.as_deref().unwrap_or("varredura completa")
         ));
-        linhas = novas;
-        nomes = juntos;
     }
-    if let Some(o) = &s.onde {
-        let mut filtradas = Vec::with_capacity(linhas.len());
-        for l in linhas {
-            if passa(
-                o,
-                &Ctx {
-                    nomes: &nomes,
-                    linha: &l,
-                    params,
-                },
-            )? {
-                filtradas.push(l);
-            }
-        }
-        linhas = filtradas;
-    }
-    Ok((nomes, linhas, plano.join("; ")))
+    Ok(plano.join("; "))
 }
 
 fn nome_saida(e: &Expr, apelido: &Option<String>, i: usize) -> String {
@@ -540,6 +623,26 @@ fn nome_saida(e: &Expr, apelido: &Option<String>, i: usize) -> String {
     }
 }
 
+/// Ordena registros (valores de saída, chaves de ordenação) pelo ORDER BY (estável).
+fn ordenar(registros: &mut [(Vec<Valor>, Vec<Valor>)], ordem: &[(Expr, bool)]) {
+    registros.sort_by(|a, b| {
+        for (i, (_, desc)) in ordem.iter().enumerate() {
+            let o = ordem_total(&a.1[i], &b.1[i]);
+            let o = if *desc { o.reverse() } else { o };
+            if o != std::cmp::Ordering::Equal {
+                return o;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// Um grupo do GROUP BY: a primeira linha (para colunas fora de agregado) e os acumuladores.
+struct Grupo {
+    primeira: Option<Vec<Valor>>,
+    acumuladores: Vec<Acumulador>,
+}
+
 fn selecionar<P: Paginas + ?Sized>(
     p: &P,
     s: &Selecao,
@@ -552,11 +655,7 @@ fn selecionar<P: Paginas + ?Sized>(
             .any(|i| matches!(i, Item::Expr(e, _) if tem_agregado(e)));
     let limite = inteiro_constante(&s.limite, params, "LIMIT")?;
     let deslocamento = inteiro_constante(&s.deslocamento, params, "OFFSET")?.unwrap_or(0);
-    // Sem ordenação nem agregação, dá para parar de ler cedo.
-    let parar_em = (!agregado && s.ordem.is_empty())
-        .then_some(limite.map(|l| (l + deslocamento) as usize))
-        .flatten();
-    let (nomes, linhas, plano) = fonte(p, s, params, parar_em)?;
+    let nomes = nomes_da_fonte(p, s)?;
 
     let mut colunas = Vec::new();
     let mut exprs: Vec<Expr> = Vec::new();
@@ -586,12 +685,9 @@ fn selecionar<P: Paginas + ?Sized>(
             }
         }
     }
-
     for (e, _) in &s.ordem {
         conferir_colunas(e, &nomes, &colunas)?;
     }
-    // Cada registro: (valores de saída, chaves de ordenação).
-    let mut registros: Vec<(Vec<Valor>, Vec<Valor>)> = Vec::new();
     let chave_ordem = |saida: &[Valor],
                        e: &Expr,
                        linha: &dyn Fn(&Expr) -> Resultado<Valor>|
@@ -615,37 +711,82 @@ fn selecionar<P: Paginas + ?Sized>(
         }
         linha(e)
     };
+    let orc = Orcamento::novo();
+    let fim = limite.map(|l| l.saturating_add(deslocamento) as usize);
+    // Cada registro: (valores de saída, chaves de ordenação).
+    let mut registros: Vec<(Vec<Valor>, Vec<Valor>)> = Vec::new();
+    let plano;
     if agregado {
-        // Grupos pela chave codificada dos valores do GROUP BY (em ordem de chave).
-        let mut grupos: std::collections::BTreeMap<Vec<u8>, Vec<Vec<Valor>>> = Default::default();
+        // Cada grupo guarda só a primeira linha e os acumuladores, nunca as linhas.
+        let mut molde = Vec::new();
+        for e in exprs
+            .iter()
+            .chain(&s.tendo)
+            .chain(s.ordem.iter().map(|(e, _)| e))
+        {
+            coletar_agregados(e, &mut molde)?;
+        }
+        let novos = || molde.iter().map(Acumulador::novo).collect::<Vec<_>>();
+        let por_grupo = tamanho_linha(&[]) + 96 * molde.len();
+        let mut grupos: std::collections::BTreeMap<Vec<u8>, Grupo> = Default::default();
         if s.agrupar.is_empty() {
-            grupos.insert(Vec::new(), linhas);
-        } else {
-            for l in linhas {
-                let ctx = Ctx {
-                    nomes: &nomes,
-                    linha: &l,
-                    params,
-                };
+            grupos.insert(
+                Vec::new(),
+                Grupo {
+                    primeira: None,
+                    acumuladores: novos(),
+                },
+            );
+        }
+        plano = fonte(p, s, params, &orc, &mut |l| {
+            let ctx = Ctx {
+                nomes: &nomes,
+                linha: &l,
+                params,
+            };
+            let chave = if s.agrupar.is_empty() {
+                Vec::new()
+            } else {
                 let k: Vec<Valor> = s
                     .agrupar
                     .iter()
                     .map(|g| avaliar(g, &ctx))
                     .collect::<Resultado<_>>()?;
-                let chave = codificar_chave(&k).unwrap_or_else(|_| format!("{k:?}").into_bytes());
-                grupos.entry(chave).or_default().push(l);
+                codificar_chave(&k).unwrap_or_else(|_| format!("{k:?}").into_bytes())
+            };
+            let g = match grupos.entry(chave) {
+                std::collections::btree_map::Entry::Occupied(o) => o.into_mut(),
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    orc.somar(por_grupo + v.key().len() + tamanho_linha(&l))?;
+                    v.insert(Grupo {
+                        primeira: None,
+                        acumuladores: novos(),
+                    })
+                }
+            };
+            for a in &mut g.acumuladores {
+                a.somar(&ctx)?;
             }
-        }
+            if g.primeira.is_none() {
+                g.primeira = Some(l);
+            }
+            Ok(true)
+        })?;
         let vazia = vec![Valor::Nulo; nomes.len()];
         for (_, g) in grupos {
-            let primeira = g.first().unwrap_or(&vazia).clone();
+            let primeira = g.primeira.unwrap_or_else(|| vazia.clone());
+            let valores: Vec<Valor> = g
+                .acumuladores
+                .iter()
+                .map(Acumulador::resultado)
+                .collect::<Resultado<_>>()?;
             let ctx = Ctx {
                 nomes: &nomes,
                 linha: &primeira,
                 params,
             };
             let valor = |e: &Expr| -> Resultado<Valor> {
-                avaliar(&resolver_agregados(e, &nomes, &g, params)?, &ctx)
+                avaliar(&trocar_agregados(e, &molde, &valores), &ctx)
             };
             let saida: Vec<Valor> = exprs.iter().map(&valor).collect::<Resultado<_>>()?;
             if let Some(t) = &s.tendo {
@@ -658,36 +799,73 @@ fn selecionar<P: Paginas + ?Sized>(
                 .iter()
                 .map(|(e, _)| chave_ordem(&saida, e, &valor))
                 .collect::<Resultado<_>>()?;
+            orc.somar(tamanho_linha(&saida))?;
             registros.push((saida, ordem));
         }
-    } else {
-        for l in &linhas {
+    } else if s.ordem.is_empty() {
+        // Sem ordenação: pula o OFFSET, guarda só o que vai para o resultado e para no LIMIT.
+        let mut lidas = 0usize;
+        plano = fonte(p, s, params, &orc, &mut |l| {
+            if fim.is_some_and(|f| lidas >= f) {
+                return Ok(false);
+            }
             let ctx = Ctx {
                 nomes: &nomes,
-                linha: l,
+                linha: &l,
+                params,
+            };
+            let saida: Vec<Valor> = exprs
+                .iter()
+                .map(|e| avaliar(e, &ctx))
+                .collect::<Resultado<_>>()?;
+            lidas += 1;
+            if lidas as u64 > deslocamento {
+                orc.somar(tamanho_linha(&saida))?;
+                registros.push((saida, Vec::new()));
+            }
+            Ok(fim.is_none_or(|f| lidas < f))
+        })?;
+        return Ok((
+            Saida {
+                colunas,
+                linhas: registros.into_iter().map(|(s, _)| s).collect(),
+                afetadas: 0,
+                ultimo_id: None,
+            },
+            plano,
+        ));
+    } else {
+        // ORDER BY: com LIMIT, guarda só as `OFFSET + LIMIT` melhores (corta de tempos em
+        // tempos); sem LIMIT, o resultado inteiro conta no orçamento.
+        let corte = fim.map(|k| k.saturating_mul(2).max(1024));
+        plano = fonte(p, s, params, &orc, &mut |l| {
+            let ctx = Ctx {
+                nomes: &nomes,
+                linha: &l,
                 params,
             };
             let valor = |e: &Expr| avaliar(e, &ctx);
             let saida: Vec<Valor> = exprs.iter().map(valor).collect::<Resultado<_>>()?;
-            let ordem = s
+            let ordem: Vec<Valor> = s
                 .ordem
                 .iter()
                 .map(|(e, _)| chave_ordem(&saida, e, &valor))
                 .collect::<Resultado<_>>()?;
+            orc.somar(tamanho_linha(&saida) + tamanho_linha(&ordem))?;
             registros.push((saida, ordem));
-        }
-    }
-    if !s.ordem.is_empty() {
-        registros.sort_by(|a, b| {
-            for (i, (_, desc)) in s.ordem.iter().enumerate() {
-                let o = ordem_total(&a.1[i], &b.1[i]);
-                let o = if *desc { o.reverse() } else { o };
-                if o != std::cmp::Ordering::Equal {
-                    return o;
+            if let (Some(k), Some(c)) = (fim, corte) {
+                if registros.len() >= c {
+                    ordenar(&mut registros, &s.ordem);
+                    for (a, b) in registros.drain(k..) {
+                        orc.tirar(tamanho_linha(&a) + tamanho_linha(&b));
+                    }
                 }
             }
-            std::cmp::Ordering::Equal
-        });
+            Ok(true)
+        })?;
+    }
+    if !s.ordem.is_empty() {
+        ordenar(&mut registros, &s.ordem);
     }
     let linhas: Vec<Vec<Valor>> = registros
         .into_iter()
@@ -769,7 +947,9 @@ fn coagir(v: Valor, c: &Coluna) -> Resultado<Valor> {
     }
 }
 
-fn linhas_que_casam<P: Paginas + ?Sized>(
+/// Chaves primárias das linhas que passam no WHERE (só as chaves ficam na memória; cada
+/// linha é relida na hora de alterar).
+fn chaves_que_casam<P: Paginas + ?Sized>(
     p: &P,
     t: &Tabela,
     onde: Option<&Expr>,
@@ -780,10 +960,10 @@ fn linhas_que_casam<P: Paginas + ?Sized>(
         conferir_colunas(o, &nomes, &[])?;
     }
     let acesso = planejar(t, onde, params, u64::MAX);
+    let orc = Orcamento::novo();
     let mut v = Vec::new();
-    let mut erro = None;
     percorrer(p, t, &acesso, u64::MAX, &mut |l| {
-        match onde.map_or(Ok(true), |o| {
+        let passou = onde.map_or(Ok(true), |o| {
             passa(
                 o,
                 &Ctx {
@@ -792,17 +972,15 @@ fn linhas_que_casam<P: Paginas + ?Sized>(
                     params,
                 },
             )
-        }) {
-            Ok(true) => v.push(l),
-            Ok(false) => {}
-            Err(e) => {
-                erro = Some(e);
-                return Ok(false);
-            }
+        })?;
+        if passou {
+            let k = t.chave_de(&l);
+            orc.somar(tamanho_linha(&k))?;
+            v.push(k);
         }
         Ok(true)
     })?;
-    erro.map_or(Ok(v), Err)
+    Ok(v)
 }
 
 fn sistema(nome: &str) -> Resultado<()> {
@@ -997,8 +1175,15 @@ pub(crate) fn executar_comando<P: PaginasMut + ?Sized>(
             for (_, e) in &alvos {
                 conferir_colunas(e, &nomes, &[])?;
             }
-            let linhas = linhas_que_casam(tx, &t, onde.as_ref(), params)?;
-            for antiga in &linhas {
+            let chaves = chaves_que_casam(tx, &t, onde.as_ref(), params)?;
+            let mut n = 0u64;
+            for chave in &chaves {
+                let Some(antiga) = t.obter_por_bytes(tx, &codificar_chave(chave)?, u64::MAX)?
+                else {
+                    continue;
+                };
+                let antiga = &antiga;
+                n += 1;
                 let mut nova = antiga.clone();
                 for (i, e) in &alvos {
                     let v = avaliar(
@@ -1018,16 +1203,17 @@ pub(crate) fn executar_comando<P: PaginasMut + ?Sized>(
                     t.gravar(tx, &nova)?;
                 }
             }
-            Ok(afetadas(linhas.len() as u64))
+            Ok(afetadas(n))
         }
         Comando::Remover { tabela, onde } => {
             sistema(tabela)?;
             let t = catalogo::tabela_obrigatoria(tx, tabela)?;
-            let linhas = linhas_que_casam(tx, &t, onde.as_ref(), params)?;
-            for l in &linhas {
-                t.remover(tx, &t.chave_de(l))?;
+            let chaves = chaves_que_casam(tx, &t, onde.as_ref(), params)?;
+            let mut n = 0u64;
+            for chave in &chaves {
+                n += u64::from(t.remover(tx, chave)?);
             }
-            Ok(afetadas(linhas.len() as u64))
+            Ok(afetadas(n))
         }
     }
 }
