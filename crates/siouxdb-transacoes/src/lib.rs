@@ -14,11 +14,14 @@
 //! - **checkpoint**: copia as páginas do WAL para o arquivo principal (respeitando as fotos
 //!   abertas) e reinicia o WAL;
 //! - [`Sincronia`] configurável: `Total` (nada confirmado se perde) ou `Normal` (mais rápido,
-//!   pode perder as últimas confirmações numa queda, nunca corromper).
+//!   pode perder as últimas confirmações numa queda, nunca corromper);
+//! - **livro-razão** ([`razao`]): cada confirmação entra numa cadeia de hashes que fixa o
+//!   estado inteiro do banco; [`Banco::verificar_razao`] confere tudo.
 
 mod banco;
 mod erro;
 mod fila;
+pub mod razao;
 mod wal;
 
 pub use banco::{
@@ -26,6 +29,7 @@ pub use banco::{
     cache_automatico_bytes,
 };
 pub use erro::{ErroBanco, Resultado};
+pub use razao::{Ancora, RelatorioRazao};
 
 #[cfg(test)]
 mod testes;

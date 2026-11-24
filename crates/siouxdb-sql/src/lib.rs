@@ -13,6 +13,7 @@
 //! UPDATE clientes SET saldo = saldo + 1 WHERE id = $1;
 //! DELETE FROM clientes WHERE saldo IS NULL;
 //! DROP TABLE|INDEX [IF EXISTS] nome;  EXPLAIN SELECT ...;
+//! VERIFY ['lsn:hash'];  -- confere o livro-razão (e a âncora guardada fora)
 //! SELECT * FROM sys_tabelas;  -- e sys_colunas, sys_indices
 //! ```
 //!
@@ -58,6 +59,18 @@ pub fn consultar<P: Paginas + ?Sized>(p: &P, sql: &str, params: &[Valor]) -> Res
         return Err(ErroSql::Semantica("consultar recebe um comando só".into()));
     }
     executor::consultar_comando(p, &cmds[0], params)
+}
+
+/// Executa um ou mais comandos só de leitura (SELECT, EXPLAIN, VERIFY), todos na mesma foto.
+pub fn consultar_todos<P: Paginas + ?Sized>(
+    p: &P,
+    sql: &str,
+    params: &[Valor],
+) -> Resultado<Vec<Saida>> {
+    executor::comandos(sql)?
+        .iter()
+        .map(|c| executor::consultar_comando(p, c, params))
+        .collect()
 }
 
 /// Executa um ou mais comandos (separados por `;`) dentro da transação. Nada é confirmado

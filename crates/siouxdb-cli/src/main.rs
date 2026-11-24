@@ -39,7 +39,9 @@ fn main() -> ExitCode {
         }
         ["criar", arquivo, resto @ ..] => criar(arquivo, resto),
         ["info", arquivo] => info(arquivo),
-        ["verificar", arquivo] => verificar(arquivo),
+        ["verificar", arquivo] => verificar(arquivo, None),
+        ["verificar", arquivo, "--ancora", ancora] => verificar(arquivo, Some(ancora)),
+        ["ancora", arquivo] => ancora(arquivo),
         ["trocar-senha", arquivo] => trocar_senha(arquivo),
         ["checkpoint", arquivo] => checkpoint(arquivo),
         ["tabelas", arquivo] => tabelas(arquivo),
@@ -73,7 +75,10 @@ fn ajuda() {
     );
     println!("  sioux info <arquivo>                                      mostra o cabeçalho");
     println!(
-        "  sioux verificar <arquivo>                                 lê e confere todas as páginas"
+        "  sioux verificar <arquivo> [--ancora lsn:hash]             confere páginas e livro-razão"
+    );
+    println!(
+        "  sioux ancora <arquivo>                                    âncora atual (guarde fora do banco)"
     );
     println!(
         "  sioux trocar-senha <arquivo>                              troca a senha sem recifrar o banco"
@@ -225,7 +230,8 @@ fn info(arquivo: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn verificar(arquivo: &str) -> Result<(), String> {
+fn verificar(arquivo: &str, ancora: Option<&str>) -> Result<(), String> {
+    let ancora: Option<siouxdb::transacoes::Ancora> = ancora.map(str::parse).transpose()?;
     let b = abrir(arquivo)?;
     let leitura = b.ler().map_err(|e| e.to_string())?;
     let total = leitura.meta().total_paginas;
@@ -245,14 +251,41 @@ fn verificar(arquivo: &str) -> Result<(), String> {
             Err(e) => return Err(e.to_string()),
         }
     }
-    if ruins == 0 {
+    if ruins > 0 {
+        return Err(format!("{ruins} página(s) com problema"));
+    }
+    println!("páginas: ok, {total} íntegras (LSN {})", leitura.lsn());
+    let r = siouxdb::transacoes::razao::verificar(&leitura, ancora.as_ref());
+    if r.tem_razao {
         println!(
-            "ok: {total} páginas, todas íntegras (LSN {})",
-            leitura.lsn()
+            "livro-razão: {} confirmações (LSN {} a {})",
+            r.confirmacoes, r.primeiro_lsn, r.ultimo_lsn
         );
-        Ok(())
-    } else {
-        Err(format!("{ruins} página(s) com problema"))
+    }
+    for p in &r.problemas {
+        println!("  {p}");
+    }
+    if !r.ok() {
+        return Err("o livro-razão não confere".into());
+    }
+    if let Some(a) = r.ancora {
+        println!("âncora: {a}");
+    }
+    if ancora.is_some() {
+        println!("âncora informada: confere");
+    }
+    println!("ok");
+    Ok(())
+}
+
+fn ancora(arquivo: &str) -> Result<(), String> {
+    let b = abrir(arquivo)?;
+    match b.ancora().map_err(|e| e.to_string())? {
+        Some(a) => {
+            println!("{a}");
+            Ok(())
+        }
+        None => Err("o banco ainda não tem livro-razão (nenhuma confirmação)".into()),
     }
 }
 
@@ -354,9 +387,16 @@ fn texto_valor(v: &siouxdb::catalogo::Valor) -> String {
 
 fn sql(arquivo: &str, comando: &str) -> Result<(), String> {
     let b = abrir(arquivo)?;
-    let mut tx = b.escrever().map_err(|e| e.to_string())?;
-    let saidas = siouxdb::sql::executar(&mut tx, comando, &[]).map_err(|e| e.to_string())?;
-    let lsn = tx.confirmar().map_err(|e| e.to_string())?;
+    let (saidas, lsn) = if siouxdb::sql::somente_leitura(comando).map_err(|e| e.to_string())? {
+        let foto = b.ler().map_err(|e| e.to_string())?;
+        let saidas =
+            siouxdb::sql::consultar_todos(&foto, comando, &[]).map_err(|e| e.to_string())?;
+        (saidas, foto.lsn())
+    } else {
+        let mut tx = b.escrever().map_err(|e| e.to_string())?;
+        let saidas = siouxdb::sql::executar(&mut tx, comando, &[]).map_err(|e| e.to_string())?;
+        (saidas, tx.confirmar().map_err(|e| e.to_string())?)
+    };
     for s in saidas {
         if s.colunas.is_empty() {
             println!("{} linha(s) afetada(s)", s.afetadas);
@@ -375,13 +415,13 @@ fn sql(arquivo: &str, comando: &str) -> Result<(), String> {
                     .chain([s.colunas[i].chars().count()])
                     .max()
                     .unwrap_or(0)
-                    .min(60)
+                    .min(100)
             })
             .collect();
         let linha = |v: &[String]| {
             v.iter()
                 .zip(&larguras)
-                .map(|(x, w)| format!("{:<w$}", x.chars().take(60).collect::<String>(), w = *w))
+                .map(|(x, w)| format!("{:<w$}", x.chars().take(100).collect::<String>(), w = *w))
                 .collect::<Vec<_>>()
                 .join(" | ")
         };

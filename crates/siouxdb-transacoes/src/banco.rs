@@ -386,7 +386,12 @@ impl<A: Arquivo> Banco<A> {
     }
 
     /// Lê a página `numero` como estava na confirmação `lsn`.
-    fn pagina_em(&self, lsn: u64, meta: &Meta, numero: NumeroPagina) -> Resultado<Arc<Pagina>> {
+    pub(crate) fn pagina_em(
+        &self,
+        lsn: u64,
+        meta: &Meta,
+        numero: NumeroPagina,
+    ) -> Resultado<Arc<Pagina>> {
         if numero < PAGINAS_RESERVADAS || numero >= meta.total_paginas {
             return Err(ErroBanco::PaginaInexistente(numero));
         }
@@ -719,12 +724,12 @@ impl<A: Arquivo> Drop for Leitura<'_, A> {
 /// Transação de escrita. Só uma por vez no banco. Sem [`Transacao::confirmar`], nada do que
 /// ela fez aparece (soltar = desfazer).
 pub struct Transacao<'a, A: Arquivo> {
-    banco: &'a Banco<A>,
+    pub(crate) banco: &'a Banco<A>,
     vez: Option<Vez<'a>>,
-    base_lsn: u64,
-    meta: Meta,
-    meta_inicial: Meta,
-    sujas: BTreeMap<NumeroPagina, Arc<Pagina>>,
+    pub(crate) base_lsn: u64,
+    pub(crate) meta: Meta,
+    pub(crate) meta_inicial: Meta,
+    pub(crate) sujas: BTreeMap<NumeroPagina, Arc<Pagina>>,
 }
 
 impl<A: Arquivo> Transacao<'_, A> {
@@ -838,6 +843,7 @@ impl<A: Arquivo> Transacao<'_, A> {
             return Ok(self.base_lsn);
         }
         let inicio = Instant::now();
+        crate::razao::registrar(&mut self)?;
         let lsn = self.base_lsn + 1;
         self.meta.ultimo_lsn = lsn;
         let tam = banco.paginador.tamanho_pagina().bytes();
@@ -851,6 +857,10 @@ impl<A: Arquivo> Transacao<'_, A> {
             e.crc,
             self.sujas.len() * (TAMANHO_QUADRO + tam) + TAMANHO_QUADRO + TAMANHO_CONFIRMACAO,
         );
+        // A cabeça do razão é a mesma página reescrita a cada confirmação (o checkpoint a copia
+        // uma vez só): não conta para o ritmo de fsync e de checkpoint.
+        let contadas =
+            self.sujas.len() as u64 - u64::from(self.sujas.contains_key(&self.meta.raiz_razao));
         let mut novas = Vec::with_capacity(self.sujas.len());
         for (n, p) in std::mem::take(&mut self.sujas) {
             let mut p = Arc::try_unwrap(p).unwrap_or_else(|compartilhada| (*compartilhada).clone());
@@ -875,8 +885,8 @@ impl<A: Arquivo> Transacao<'_, A> {
         e.fim += m.bytes.len() as u64;
         e.crc = m.crc;
         e.paginas += novas.len() as u64;
-        e.desde_checkpoint += novas.len() as u64;
-        let novas_paginas = novas.len() as u64;
+        e.desde_checkpoint += contadas;
+        let novas_paginas = contadas;
         banco
             .quadros_gravados
             .fetch_add(novas.len() as u64, Ordering::Relaxed);

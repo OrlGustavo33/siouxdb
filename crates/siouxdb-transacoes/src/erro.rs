@@ -20,6 +20,8 @@ pub enum ErroBanco {
     WalAdulterado,
     /// Uma gravação ou `fsync` falhou antes; o estado em disco é incerto. Feche e abra de novo.
     Falhou,
+    /// A estrutura do livro-razão está danificada (rode o `VERIFY` para o diagnóstico).
+    Razao(String),
 }
 
 impl fmt::Display for ErroBanco {
@@ -41,6 +43,7 @@ impl fmt::Display for ErroBanco {
             ErroBanco::Falhou => {
                 write!(f, "uma gravação falhou antes; feche e abra o banco de novo")
             }
+            ErroBanco::Razao(m) => write!(f, "livro-razão: {m}"),
         }
     }
 }

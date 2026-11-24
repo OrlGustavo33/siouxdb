@@ -74,7 +74,7 @@ Cifrado é o padrão da CLI (`sioux criar`); `--sem-cifra` cria em claro.
 Dados associados: `"SIOUXPAG"` + número da página (u64) + versão do formato (u32). Página copiada para outra posição, alterada, cortada por queda ou de outro arquivo **não decifra** e é tratada como corrompida.
 
 ### Limites conhecidos (resolvidos em marcos seguintes)
-- **Reversão de página**: trocar uma página pela versão antiga **da mesma posição** (de uma cópia antiga do arquivo) ainda passa. A cadeia de hashes do livro-razão (M6) fecha isso.
+- **Reversão de página**: trocar uma página pela versão antiga **da mesma posição** (de uma cópia antiga do arquivo) ainda decifra. Quem pega é o `VERIFY` do livro-razão (seção abaixo); a leitura comum não confere o razão.
 - O cabeçalho revela, em claro, tamanho de página, número de páginas e raízes (não o conteúdo).
 
 ## WAL e transações (implementado no M3, `siouxdb-transacoes`)
@@ -149,10 +149,24 @@ Reescreve o log de uma tabela guardando, por chave, as versões posteriores ao L
 - O índice da chave primária leva à versão mais nova; remoção também é versão (o histórico continua alcançável).
 - Catálogo: árvore B+ na `raiz_catalogo` do cabeçalho do banco — `00 "proximo_id"` → contador; `01 + nome` → definição, codificada como uma linha: id, nome, cabeçalho, nº de colunas, (nome, tipo, não-nulo) por coluna, nº de colunas da chave e suas posições, nº de índices e (nome, único, raiz, nº de colunas, posições) por índice, coluna automática (−1 = nenhuma) e, por coluna, o padrão (0 nenhum; 1 + valor; 2 = agora). `sys_tabelas` e `sys_colunas` são visões calculadas.
 
+## Livro-razão (página tipo 6, `siouxdb-transacoes::razao`)
+
+Cada confirmação acrescenta uma entrada, **no mesmo quadro do WAL** das páginas dela (a entrada existe se e só se a confirmação existe). Hashes: BLAKE3 em modo `derive_key`, com contextos `"SiouxDB razao pagina v1"`, `"SiouxDB razao estado v1"` e `"SiouxDB razao cadeia v1"`.
+
+- **Soma das páginas (LtHash 1024 × u16):** cada página de número `n` em `2..total_paginas`, exceto as do tipo 6, contribui com `XOF(pagina; n u64 ‖ tipo u8 ‖ conteúdo)` de 2048 bytes, lidos como 1024 u16 little-endian; a soma é faixa a faixa, módulo 2¹⁶. Na confirmação só as páginas alteradas mudam a soma (sai a versão de antes, entra a nova). O LSN e o CRC do cabeçalho da página não entram.
+- **Estado:** `BLAKE3(estado; soma (2048 bytes) ‖ meta de 40 bytes, com ultimo_lsn = LSN da confirmação)`.
+- **Elo:** `BLAKE3(cadeia; elo anterior (32, zeros na primeira) ‖ lsn u64 ‖ instante u64 ‖ estado)`. Instante em µs desde 1970, UTC.
+- **Entrada (80 bytes):** lsn u64 · instante u64 · estado (32) · elo (32).
+- **Cabeça** (página em `raiz_razao`; conteúdo): `0..4` `"SXRZ"` · `4..8` entradas nesta página (u32) · `8..16` última página arquivada (0 = nenhuma) · `16..24` total de entradas · `24..56` último elo · `56..64` reservado · `64..2112` soma · entradas a partir de `2112`.
+- **Página arquivada:** quando a cabeça enche, as entradas dela vão para uma página nova: `0..4` `"SXRA"` · `4..8` quantidade · `8..16` arquivada anterior · entradas a partir de `16`. Nunca é reescrita.
+- **Criação:** bancos sem razão (`raiz_razao = 0`, inclusive os gravados antes dele) ganham a cabeça na próxima confirmação, que soma todas as páginas uma vez.
+
+**`VERIFY`** recalcula a cadeia do começo (ordem dos LSNs e cada elo), confere o último elo e o total com a cabeça, soma todas as páginas de novo e compara com a soma guardada e com o estado da última entrada, que tem de ser do LSN atual da meta. Com uma **âncora** (`lsn:hash` do elo, guardada fora do banco), confere também que aquela confirmação está na cadeia com o mesmo elo: é o que pega um arquivo que voltou inteiro no tempo (cópia antiga) ou um passado reescrito por quem tem a chave.
+
 ## Tipos de página (planejados)
-bloco frio em colunas · resumo de bloco · ledger (os demais já existem).
+bloco frio em colunas · resumo de bloco (os demais já existem).
 
 ## A definir antes da v0.1
-- Encadeamento de hashes do livro-razão (M6).
+- Pontos de controle assinados e MMR no livro-razão (hoje: cadeia + âncora).
 - Codificação das colunas da camada fria.
 - Arquivos de exemplo em `spec/exemplos/`, abertos por todo CI.

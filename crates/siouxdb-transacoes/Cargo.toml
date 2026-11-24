@@ -13,6 +13,7 @@ siouxdb-vfs.workspace = true
 siouxdb-armazenamento.workspace = true
 siouxdb-metricas.workspace = true
 siouxdb-cripto.workspace = true
+blake3 = "1.8"
 
 [lints]
 workspace = true

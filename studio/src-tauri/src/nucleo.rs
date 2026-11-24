@@ -60,8 +60,12 @@ pub struct Verificacao {
     pub quando: u64,
     /// Páginas lidas.
     pub paginas: u64,
-    /// Problemas encontrados (vazio = tudo íntegro).
+    /// Problemas encontrados (vazio = tudo íntegro), inclusive os do livro-razão.
     pub problemas: Vec<String>,
+    /// Confirmações conferidas no livro-razão.
+    pub confirmacoes: u64,
+    /// Âncora atual do razão (`lsn:hash`), para guardar fora do banco.
+    pub ancora: Option<String>,
     /// Quanto demorou.
     pub duracao_ms: u64,
 }
@@ -314,6 +318,8 @@ impl Studio {
                 problemas.push(e.to_string());
             }
         }
+        let razao = siouxdb::transacoes::razao::verificar(&leitura, None);
+        problemas.extend(razao.problemas.iter().cloned());
         drop(leitura);
         let v = Verificacao {
             quando: SystemTime::now()
@@ -322,6 +328,8 @@ impl Studio {
                 .unwrap_or(0),
             paginas: total,
             problemas,
+            confirmacoes: razao.confirmacoes,
+            ancora: razao.ancora.map(|a| a.to_string()),
             duracao_ms: inicio.elapsed().as_millis() as u64,
         };
         if let Some(s) = self.travar().as_mut()

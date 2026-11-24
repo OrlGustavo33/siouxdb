@@ -226,7 +226,7 @@ async function executar(acao) {
       case "verificar": {
         const v = await api("verificar");
         if (v.problemas.length) avisar(`Verificação: ${v.problemas.length} problema(s). Primeiro: ${v.problemas[0]}`);
-        else avisar(`Verificação concluída: ${num.format(v.paginas)} páginas íntegras em ${num.format(v.duracao_ms)} ms.`, true);
+        else avisar(`Verificação concluída: ${num.format(v.paginas)} páginas íntegras e ${num.format(v.confirmacoes)} confirmações no livro-razão, em ${num.format(v.duracao_ms)} ms.` + (v.ancora ? ` Âncora (guarde fora do banco): ${v.ancora}` : ""), true);
         break;
       }
       case "limites": abrirLimites(); return;
@@ -323,7 +323,7 @@ function criarPrevia() {
       case "demonstracao": sessao = { origem: "demonstracao", caminho: "/tmp/siouxdb-studio-demo.sdb", pagina_kb: 4, cifrado: true, lsn_checkpoint: 0 }; foto = passo(); return {};
       case "abrir": case "criar": throw "Prévia no navegador: abrir e criar arquivos só no aplicativo.";
       case "fechar": sessao = null; return null;
-      case "verificar": verificacao = { quando: Date.now() / 1000, paginas, problemas: [], duracao_ms: 12 }; return verificacao;
+      case "verificar": verificacao = { quando: Date.now() / 1000, paginas, problemas: [], confirmacoes: 1234, ancora: "1234:" + "ab".repeat(32), duracao_ms: 12 }; return verificacao;
       case "definir_limites": limites = args.limites; return null;
       case "painel":
         if (!sessao) return null;

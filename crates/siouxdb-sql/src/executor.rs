@@ -4,7 +4,7 @@ use crate::avaliar::{
     Ctx, avaliar, conferir_colunas, decimal_de, ordem_total, passa, resolver_agregados,
     resolver_coluna, tem_agregado, tem_coluna,
 };
-use crate::erro::semantica;
+use crate::erro::{ErroSql, semantica};
 use crate::parser::{ColDef, Comando, Conflito, Expr, Item, Op, Selecao, analisar};
 use crate::{Resultado, Saida};
 use siouxdb_catalogo::catalogo;
@@ -824,6 +824,9 @@ pub(crate) fn executar_comando<P: PaginasMut + ?Sized>(
         ultimo_id: None,
     };
     match c {
+        Comando::Verificar { .. } => semantica(
+            "VERIFY confere uma foto do banco: mande-o sozinho (ou só com SELECTs), sem comandos que gravam",
+        ),
         Comando::Selecionar(s) => Ok(selecionar(tx, s, params)?.0),
         Comando::Explicar(s) => {
             let (_, plano) = selecionar(tx, s, params)?;
@@ -1046,10 +1049,50 @@ pub(crate) fn consultar_comando<P: Paginas + ?Sized>(
                 ultimo_id: None,
             })
         }
+        Comando::Verificar { ancora } => verificar(p, ancora.as_deref()),
         _ => semantica("só SELECT numa leitura; para gravar use uma transação"),
     }
 }
 
 pub(crate) fn comandos(sql: &str) -> Resultado<Vec<Comando>> {
     analisar(sql)
+}
+
+/// `VERIFY`: uma linha por item (`item`, `valor`); cada problema vira uma linha `problema`.
+fn verificar<P: Paginas + ?Sized>(p: &P, ancora: Option<&str>) -> Resultado<Saida> {
+    let ancora = match ancora {
+        Some(t) => Some(
+            t.parse::<siouxdb_transacoes::Ancora>()
+                .map_err(ErroSql::Semantica)?,
+        ),
+        None => None,
+    };
+    let r = siouxdb_transacoes::razao::verificar(p, ancora.as_ref());
+    let txt = |a: &str, b: String| vec![Valor::Texto(a.into()), Valor::Texto(b)];
+    let num = |a: &str, n: u64| vec![Valor::Texto(a.into()), Valor::Inteiro(n as i64)];
+    let mut linhas = vec![
+        txt("resultado", if r.ok() { "OK" } else { "FALHOU" }.into()),
+        num("confirmacoes", r.confirmacoes),
+        num("primeiro_lsn", r.primeiro_lsn),
+        num("ultimo_lsn", r.ultimo_lsn),
+        num("paginas", r.paginas),
+    ];
+    if r.ultimo_instante > 0 {
+        linhas.push(vec![
+            Valor::Texto("ultimo_instante".into()),
+            Valor::DataHora(r.ultimo_instante as i64),
+        ]);
+    }
+    if let Some(a) = r.ancora {
+        linhas.push(txt("ancora", a.to_string()));
+    }
+    for m in r.problemas {
+        linhas.push(txt("problema", m));
+    }
+    Ok(Saida {
+        colunas: vec!["item".into(), "valor".into()],
+        linhas,
+        afetadas: 0,
+        ultimo_id: None,
+    })
 }

@@ -1361,3 +1361,38 @@ fn diferencial_join_contra_laco_em_rust() {
         assert!(todos.contains(p), "plano não exercitado: {p}\n{todos}");
     }
 }
+
+#[test]
+fn verify_confere_o_razao_e_a_ancora() {
+    let (_vfs, b) = banco();
+    exec(&b, "CREATE TABLE t (id INTEIRO PRIMARY KEY, v TEXTO)", &[]);
+    for i in 0..30 {
+        exec(&b, "INSERT INTO t VALUES (?, 'x')", &[v(i)]);
+    }
+    let item = |linhas: &[Vec<Valor>], nome: &str| {
+        linhas
+            .iter()
+            .find(|l| l[0] == v(nome))
+            .map(|l| l[1].clone())
+            .unwrap_or_else(|| panic!("sem {nome}: {linhas:?}"))
+    };
+    assert!(somente_leitura("VERIFY").unwrap());
+    let r = q(&b, "VERIFY", &[]);
+    assert_eq!(item(&r, "resultado"), v("OK"), "{r:?}");
+    assert_eq!(item(&r, "confirmacoes"), v(31));
+    let Valor::Texto(ancora) = item(&r, "ancora") else {
+        panic!()
+    };
+    exec(&b, "UPDATE t SET v = 'y' WHERE id = 3", &[]);
+    let r = q(&b, &format!("VERIFY '{ancora}'"), &[]);
+    assert_eq!(item(&r, "resultado"), v("OK"), "{r:?}");
+    let falsa = format!("{}0", &ancora[..ancora.len() - 1]);
+    let falsa = if falsa == ancora {
+        format!("{}1", &ancora[..ancora.len() - 1])
+    } else {
+        falsa
+    };
+    let r = q(&b, &format!("VERIFICAR '{falsa}'"), &[]);
+    assert_eq!(item(&r, "resultado"), v("FALHOU"), "{r:?}");
+    assert!(matches!(erro(&b, "VERIFY 'lixo'"), ErroSql::Semantica(_)));
+}

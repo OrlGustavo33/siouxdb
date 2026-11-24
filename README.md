@@ -89,7 +89,8 @@ Só o motor é obrigatório; o resto é opcional. Embutido (como o SQLite) ou se
 - **manutenção automática** (`siouxdb::manutencao`): compacta tabelas com muito histórico e faz **backup periódico** com rodízio e teste de restauração (abre e lê a cópia inteira); **cache automático** (1/8 da memória, 16–512 MiB);
 - **formato 1 congelado**: arquivos de exemplo em `spec/exemplos/` são abertos em todo CI; testes de robustez (arquivo e WAL estragados, SQL aleatório) e simulação noturna longa (`.github/workflows/noturno.yml`);
 - **índices secundários** (inclusive `UNIQUE`) e **SQL** (`siouxdb-sql`): `CREATE/DROP TABLE|INDEX`, `INSERT` com conflito, `SELECT` com `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`AS OF`, `UPDATE`, `DELETE`, `EXPLAIN`, parâmetros `?`/`$1`;
-- comando `sioux criar | info | verificar | trocar-senha | checkpoint | tabelas | sql | backup | compactar`.
+- **livro-razão**: cada confirmação entra numa cadeia de hashes (BLAKE3) que fixa o estado inteiro do banco (soma LtHash de todas as páginas). `VERIFY` pega página alterada, página que voltou a uma versão antiga (mesmo cifrada) e entrada do histórico mexida; com uma **âncora** guardada fora (`sioux ancora`), pega também um arquivo que voltou inteiro no tempo;
+- comando `sioux criar | info | verificar [--ancora] | ancora | trocar-senha | checkpoint | tabelas | sql | backup | compactar`.
 - `siouxdb-metricas`: histograma sem trava, séries de 60 s e alertas configuráveis;
 - **SiouxDB Studio** (`studio/`, Tauri): painel de monitoramento em tempo real sobre um arquivo ou uma demonstração com carga gerada.
 
@@ -104,6 +105,8 @@ Banco **cifrado**, páginas de 8 KiB, cada transação altera 1 página, 2 leito
 | Total | 32 | 4.115 | 15,1 | 7,3 / 23,1 ms |
 | Normal | 1 | 7.788 | 205 | 0,07 / 0,18 ms |
 | Normal | 8 | 6.291 | 208 | 0,85 / 9,4 ms |
+
+Números de antes do **livro-razão**. Com ele, cada confirmação também reescreve a cabeça do razão e faz o hash das páginas alteradas (versão velha e nova; ~12 µs por página de 8 KiB nesta máquina). Na sincronia Total nada muda, porque o limite continua sendo o `fsync`. Na Normal, o pior caso (1 página por transação) cai para **4,0 mil/s** com 1 escritor e **3,3 mil/s** com 8. Um `INSERT` SQL de uma linha por transação vai de 2,2 mil/s para 1,6 mil/s.
 
 Tabela com 1 milhão de linhas (3 colunas, inseridas em ordem embaralhada, lotes de 10 mil por transação), `cargo run --release -p siouxdb-catalogo --example linhas -- 1000000 <pasta> <cache>`:
 

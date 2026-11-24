@@ -129,6 +129,10 @@ pub(crate) enum Comando {
     },
     Selecionar(Selecao),
     Explicar(Selecao),
+    /// `VERIFY ['lsn:hash']`: confere o livro-razão (e a âncora, se vier).
+    Verificar {
+        ancora: Option<String>,
+    },
     Atualizar {
         tabela: String,
         mudancas: Vec<(String, Expr)>,
@@ -142,7 +146,10 @@ pub(crate) enum Comando {
 
 impl Comando {
     pub fn so_leitura(&self) -> bool {
-        matches!(self, Comando::Selecionar(_) | Comando::Explicar(_))
+        matches!(
+            self,
+            Comando::Selecionar(_) | Comando::Explicar(_) | Comando::Verificar { .. }
+        )
     }
 }
 
@@ -313,6 +320,16 @@ impl Parser {
         if self.eh_chave("insert") || self.eh_chave("replace") {
             return self.inserir();
         }
+        if self.chave("verify") || self.chave("verificar") {
+            let ancora = match self.tok() {
+                Tok::Texto(t) => Some(t.clone()),
+                _ => None,
+            };
+            if ancora.is_some() {
+                self.avancar();
+            }
+            return Ok(Comando::Verificar { ancora });
+        }
         if self.chave("explain") {
             self.espera_chave("select")?;
             return Ok(Comando::Explicar(self.selecao()?));
@@ -354,7 +371,7 @@ impl Parser {
             return Ok(Comando::Remover { tabela, onde });
         }
         self.erro(
-            "comando desconhecido (use CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, DELETE ou EXPLAIN)",
+            "comando desconhecido (use CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, DELETE, EXPLAIN ou VERIFY)",
         )
     }
 

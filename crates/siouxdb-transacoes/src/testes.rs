@@ -195,6 +195,7 @@ fn checkpoint_automatico_mantem_o_wal_limitado_sob_carga() {
         }
     });
     let e = b.estatisticas();
+    // A cabeça do razão não conta: 600 confirmações × 1 página.
     assert!(e.checkpoints >= 600 / 20 / 2, "{e:?}");
     assert!(e.checkpoints <= 600 / 20 + 2, "checkpoint demais: {e:?}");
     assert!(e.paginas_no_wal <= 200, "WAL cresceu demais: {e:?}");
@@ -223,7 +224,7 @@ fn liberar_e_reaproveitar() {
     );
     assert_eq!(
         tx.alocar(TipoPagina::Catalogo).unwrap(),
-        c + 1,
+        c + 2, // c + 1 é a cabeça do razão
         "sem livres, cresce"
     );
 }
@@ -410,6 +411,8 @@ fn conferir_apos_queda(
         .unwrap_or_else(|| panic!("{ctx}: LSN {lsn} não está no histórico"));
     historico.truncate(i + 1);
     let modelo = historico[i].1.clone();
+    let r = crate::razao::verificar(&l, None);
+    assert!(r.ok(), "{ctx}: razão não confere depois da queda: {r:?}");
     for (n, m) in &modelo {
         let p = l
             .pagina(*n)
@@ -547,4 +550,181 @@ fn fator_simulacao() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
+}
+
+// ---------------------------------------------------------------- livro-razão
+
+const TAM: u64 = 4096;
+
+/// Lê os bytes crus da página `n` no arquivo principal.
+fn pagina_crua(vfs: &VfsSimulado, n: NumeroPagina) -> Vec<u8> {
+    let arq = vfs
+        .abrir(&caminho(), ModoAbertura::LeituraGravacao)
+        .unwrap();
+    let mut b = vec![0u8; TAM as usize];
+    arq.ler_exato_em(n * TAM, &mut b).unwrap();
+    b
+}
+
+/// Grava bytes crus na página `n` do arquivo principal (o "atacante").
+fn trocar_pagina_crua(vfs: &VfsSimulado, n: NumeroPagina, bytes: &[u8]) {
+    let arq = vfs
+        .abrir(&caminho(), ModoAbertura::LeituraGravacao)
+        .unwrap();
+    arq.gravar_em(n * TAM, bytes).unwrap();
+    arq.sincronizar().unwrap();
+}
+
+fn config_sem_checkpoint() -> Config {
+    Config {
+        checkpoint_apos_paginas: 0,
+        ..Config::default()
+    }
+}
+
+#[test]
+fn razao_confere_e_guarda_varias_paginas_de_historico() {
+    for cifrado in [false, true] {
+        let vfs = disco(40);
+        let b = criar(&vfs, cifrado, config_sem_checkpoint());
+        let r = b.verificar_razao(None).unwrap();
+        assert!(r.ok() && !r.tem_razao, "banco vazio: {r:?}");
+        let mut tx = b.escrever().unwrap();
+        let n = tx.alocar(TipoPagina::NoArvore).unwrap();
+        tx.confirmar().unwrap();
+        let mut ancoras = Vec::new();
+        // Bem mais que cabe na cabeça: força páginas arquivadas.
+        for i in 0..200 {
+            let mut tx = b.escrever().unwrap();
+            escrever(&mut tx, n, marca(&format!("v{i}")));
+            if i % 7 == 0 {
+                let extra = tx.alocar(TipoPagina::NoArvore).unwrap();
+                escrever(&mut tx, extra, marca("extra"));
+            }
+            if i % 11 == 0 && i > 0 {
+                let m = tx.meta().total_paginas - 1;
+                if tx.pagina(m).unwrap().tipo() == TipoPagina::NoArvore && m != n {
+                    tx.liberar(m).unwrap();
+                }
+            }
+            tx.confirmar().unwrap();
+            if i % 50 == 0 {
+                ancoras.push(b.ancora().unwrap().unwrap());
+            }
+            if i == 120 {
+                b.checkpoint().unwrap();
+            }
+        }
+        let r = b.verificar_razao(None).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert_eq!(r.confirmacoes, 201);
+        assert_eq!((r.primeiro_lsn, r.ultimo_lsn), (1, 201));
+        for a in &ancoras {
+            let texto = a.to_string();
+            let lida: crate::Ancora = texto.parse().unwrap();
+            assert_eq!(&lida, a);
+            assert!(b.verificar_razao(Some(a)).unwrap().ok(), "âncora {a}");
+        }
+        // Âncora com um bit trocado: histórico "reescrito".
+        let mut falsa = ancoras[1];
+        falsa.elo[0] ^= 1;
+        let r = b.verificar_razao(Some(&falsa)).unwrap();
+        assert!(!r.ok() && r.problemas[0].contains("reescrito"), "{r:?}");
+        // Reabre: continua conferindo e continua a cadeia.
+        drop(b);
+        let b = abrir(&vfs, cifrado, config_sem_checkpoint());
+        let mut tx = b.escrever().unwrap();
+        escrever(&mut tx, n, marca("depois"));
+        tx.confirmar().unwrap();
+        let r = b.verificar_razao(Some(&ancoras[0])).unwrap();
+        assert!(r.ok() && r.confirmacoes == 202, "{r:?}");
+    }
+}
+
+#[test]
+fn razao_pega_pagina_que_voltou_a_versao_antiga() {
+    // Num banco cifrado a versão antiga da página ainda autentica (mesma posição, mesma
+    // chave): só o razão pega.
+    for cifrado in [false, true] {
+        let vfs = disco(41);
+        let b = criar(&vfs, cifrado, config_sem_checkpoint());
+        let mut tx = b.escrever().unwrap();
+        let n = tx.alocar(TipoPagina::NoArvore).unwrap();
+        escrever(&mut tx, n, marca("saldo 10"));
+        tx.confirmar().unwrap();
+        b.checkpoint().unwrap();
+        let antiga = pagina_crua(&vfs, n);
+        let mut tx = b.escrever().unwrap();
+        escrever(&mut tx, n, marca("saldo 9000"));
+        tx.confirmar().unwrap();
+        b.checkpoint().unwrap();
+        drop(b);
+        trocar_pagina_crua(&vfs, n, &antiga);
+        let b = abrir(&vfs, cifrado, config_sem_checkpoint());
+        assert_eq!(
+            conteudo(&b, n),
+            marca("saldo 10"),
+            "a página velha é aceita"
+        );
+        let r = b.verificar_razao(None).unwrap();
+        assert!(
+            r.problemas
+                .iter()
+                .any(|p| p.contains("voltou a uma versão antiga")),
+            "cifrado={cifrado}: {r:?}"
+        );
+    }
+}
+
+#[test]
+fn razao_pega_entrada_alterada_e_arquivo_que_voltou_no_tempo() {
+    let vfs = disco(42);
+    let b = criar(&vfs, false, config_sem_checkpoint());
+    let mut tx = b.escrever().unwrap();
+    let n = tx.alocar(TipoPagina::NoArvore).unwrap();
+    tx.confirmar().unwrap();
+    for i in 0..60 {
+        let mut tx = b.escrever().unwrap();
+        escrever(&mut tx, n, marca(&format!("v{i}")));
+        tx.confirmar().unwrap();
+    }
+    // Cópia "antiga" do arquivo inteiro.
+    b.copiar_para(&vfs, Path::new("antigo.sdb")).unwrap();
+    for i in 60..70 {
+        let mut tx = b.escrever().unwrap();
+        escrever(&mut tx, n, marca(&format!("v{i}")));
+        tx.confirmar().unwrap();
+    }
+    let ancora = b.ancora().unwrap().unwrap();
+    b.checkpoint().unwrap();
+    let raiz = b.ler().unwrap().meta().raiz_razao;
+    let arquivada = {
+        let cab = b.ler().unwrap().pagina(raiz).unwrap();
+        u64::from_le_bytes(cab.conteudo()[8..16].try_into().unwrap())
+    };
+    assert_ne!(arquivada, 0, "60+ confirmações já arquivaram entradas");
+    drop(b);
+
+    // 1) O arquivo inteiro voltou no tempo: sozinho ele confere; com a âncora, não.
+    let antigo = B::abrir(&vfs, Path::new("antigo.sdb"), None, config_sem_checkpoint()).unwrap();
+    assert!(antigo.verificar_razao(None).unwrap().ok());
+    let r = antigo.verificar_razao(Some(&ancora)).unwrap();
+    assert!(
+        r.problemas.iter().any(|p| p.contains("voltou no tempo")),
+        "{r:?}"
+    );
+    drop(antigo);
+
+    // 2) Alguém muda o instante de uma entrada arquivada e refaz o CRC da página.
+    let bytes = pagina_crua(&vfs, arquivada);
+    let mut p = siouxdb_armazenamento::Pagina::de_bytes(bytes.into(), arquivada).unwrap();
+    p.conteudo_mut()[16 + 8] ^= 1;
+    let selada = p.selar(arquivada).to_vec();
+    trocar_pagina_crua(&vfs, arquivada, &selada);
+    let b = abrir(&vfs, false, config_sem_checkpoint());
+    let r = b.verificar_razao(None).unwrap();
+    assert!(
+        r.problemas.iter().any(|p| p.contains("cadeia quebrada")),
+        "{r:?}"
+    );
 }
