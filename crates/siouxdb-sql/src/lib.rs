@@ -90,3 +90,5 @@ pub fn executar<P: PaginasMut + ?Sized>(
 
 #[cfg(test)]
 mod testes;
+#[cfg(test)]
+mod testes_sqlite;

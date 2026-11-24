@@ -1480,3 +1480,36 @@ fn consultas_respeitam_o_limite_de_memoria() {
     assert_eq!(q(&b, "SELECT COUNT(*) FROM m", &[]), vec![vec![v(n / 2)]]);
     assert_eq!(q(&b, "SELECT v FROM m WHERE id = 0", &[]), vec![vec![v(1)]]);
 }
+
+#[test]
+fn round_em_decimal_e_exato_e_funcoes_de_texto() {
+    let (_vfs, b) = banco();
+    exec(
+        &b,
+        "CREATE TABLE p (id INTEIRO PRIMARY KEY, v DECIMAL)",
+        &[],
+    );
+    exec(
+        &b,
+        "INSERT INTO p VALUES (1, '2.675'), (2, '-2.675'), (3, '1.005'), (4, '0.4999999999')",
+        &[],
+    );
+    let d = |s: &str| Valor::Decimal(siouxdb_catalogo::Decimal::de_texto(s).unwrap());
+    assert_eq!(
+        q(&b, "SELECT ROUND(v, 2), ROUND(v) FROM p ORDER BY id", &[]),
+        vec![
+            vec![d("2.68"), d("3")],
+            vec![d("-2.68"), d("-3")],
+            vec![d("1.01"), d("1")],
+            vec![d("0.5"), d("0")],
+        ]
+    );
+    assert_eq!(
+        q(
+            &b,
+            "SELECT SUBSTR('sioux', 2, 3), TRIM('  a  '), REPLACE('a-b-c', '-', ''), INSTR('banana', 'na'), NULLIF(1, 1), IFNULL(NULL, 'x')",
+            &[]
+        ),
+        vec![vec![v("iou"), v("a"), v("abc"), v(3), Valor::Nulo, v("x")]]
+    );
+}

@@ -687,6 +687,22 @@ fn selecionar<P: Paginas + ?Sized>(
     }
     for (e, _) in &s.ordem {
         conferir_colunas(e, &nomes, &colunas)?;
+        // ORDER BY <número> = posição no resultado: conferida antes de ler qualquer linha
+        // (senão, com resultado vazio, o erro nunca apareceria).
+        let posicao = match e {
+            Expr::Valor(Valor::Inteiro(n)) => Some(*n),
+            Expr::Negativo(x) if matches!(**x, Expr::Valor(Valor::Inteiro(_))) => Some(-1),
+            _ => None,
+        };
+        if let Some(n) = posicao {
+            if n < 1 || n as usize > colunas.len() {
+                return semantica(format!(
+                    "ORDER BY {n}: o resultado tem {} coluna(s); use de 1 a {}",
+                    colunas.len(),
+                    colunas.len()
+                ));
+            }
+        }
     }
     let chave_ordem = |saida: &[Valor],
                        e: &Expr,

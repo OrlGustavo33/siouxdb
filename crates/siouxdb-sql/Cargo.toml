@@ -15,6 +15,8 @@ siouxdb-catalogo.workspace = true
 [dev-dependencies]
 siouxdb-armazenamento.workspace = true
 siouxdb-vfs.workspace = true
+# Só nos testes: o mesmo SQL roda no SQLite e os resultados são comparados.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [lints]
 workspace = true

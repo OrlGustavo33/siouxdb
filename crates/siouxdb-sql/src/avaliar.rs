@@ -419,6 +419,95 @@ fn funcao(nome: &str, v: Vec<Valor>) -> Resultado<Valor> {
             Valor::Nulo => Valor::Nulo,
             _ => return semantica("ABS() recebe número"),
         },
+        "round" | "arredondar" => {
+            let casas = match v.get(1) {
+                None => 0,
+                Some(Valor::Inteiro(n)) => *n,
+                Some(Valor::Nulo) => return Ok(Valor::Nulo),
+                Some(_) => return semantica("ROUND(x, casas): casas precisa ser inteiro"),
+            };
+            match v.first() {
+                Some(Valor::Real(r)) if v.len() <= 2 => Valor::Real(arredondar_real(*r, casas)),
+                Some(Valor::Inteiro(i)) if v.len() <= 2 => Valor::Real(*i as f64),
+                Some(Valor::Decimal(d)) if v.len() <= 2 => {
+                    Valor::Decimal(arredondar_decimal(*d, casas))
+                }
+                Some(Valor::Nulo) if v.len() <= 2 => Valor::Nulo,
+                _ => return semantica("ROUND(x [, casas]) recebe um número"),
+            }
+        }
+        "substr" | "substring" => {
+            if !(2..=3).contains(&v.len()) {
+                return semantica("SUBSTR(texto, início [, quantos])");
+            }
+            match (&v[0], &v[1], v.get(2)) {
+                (Valor::Nulo, ..) | (_, Valor::Nulo, _) | (_, _, Some(Valor::Nulo)) => Valor::Nulo,
+                (Valor::Texto(t), Valor::Inteiro(ini), q) => {
+                    let q = match q {
+                        None => None,
+                        Some(Valor::Inteiro(q)) => Some(*q),
+                        Some(_) => return semantica("SUBSTR: quantos precisa ser inteiro"),
+                    };
+                    Valor::Texto(substr(t, *ini, q))
+                }
+                _ => return semantica("SUBSTR(texto, início [, quantos])"),
+            }
+        }
+        "trim" | "ltrim" | "rtrim" => {
+            let tirar: Vec<char> = match v.get(1) {
+                None => vec![' '],
+                Some(Valor::Texto(c)) => c.chars().collect(),
+                Some(Valor::Nulo) => return Ok(Valor::Nulo),
+                Some(_) => return semantica("TRIM(texto [, caracteres])"),
+            };
+            match v.first() {
+                Some(Valor::Texto(t)) if v.len() <= 2 => {
+                    let t = if nome != "rtrim" {
+                        t.trim_start_matches(&tirar[..])
+                    } else {
+                        t
+                    };
+                    let t = if nome != "ltrim" {
+                        t.trim_end_matches(&tirar[..])
+                    } else {
+                        t
+                    };
+                    Valor::Texto(t.to_string())
+                }
+                Some(Valor::Nulo) if v.len() <= 2 => Valor::Nulo,
+                _ => return semantica("TRIM(texto [, caracteres])"),
+            }
+        }
+        "replace" | "trocar" => match (v.first(), v.get(1), v.get(2), v.len()) {
+            (Some(Valor::Texto(t)), Some(Valor::Texto(de)), Some(Valor::Texto(para)), 3) => {
+                Valor::Texto(if de.is_empty() {
+                    t.clone()
+                } else {
+                    t.replace(de.as_str(), para)
+                })
+            }
+            (_, _, _, 3) if v.iter().any(|x| matches!(x, Valor::Nulo)) => Valor::Nulo,
+            _ => return semantica("REPLACE(texto, de, para) recebe textos"),
+        },
+        "instr" | "posicao" => match (v.first(), v.get(1), v.len()) {
+            (Some(Valor::Texto(t)), Some(Valor::Texto(p)), 2) => Valor::Inteiro(
+                t.find(p.as_str())
+                    .map_or(0, |b| t[..b].chars().count() as i64 + 1),
+            ),
+            (_, _, 2) if v.iter().any(|x| matches!(x, Valor::Nulo)) => Valor::Nulo,
+            _ => return semantica("INSTR(texto, procurado) recebe textos"),
+        },
+        "ifnull" if v.len() == 2 => v
+            .into_iter()
+            .find(|x| !matches!(x, Valor::Nulo))
+            .unwrap_or(Valor::Nulo),
+        "nullif" if v.len() == 2 => {
+            if comparar(&v[0], &v[1])? == Some(Ordering::Equal) {
+                Valor::Nulo
+            } else {
+                v[0].clone()
+            }
+        }
         "agora" | "now" if v.is_empty() => Valor::DataHora(datahora::agora()),
         "coalesce" => v
             .into_iter()
@@ -426,6 +515,104 @@ fn funcao(nome: &str, v: Vec<Valor>) -> Resultado<Valor> {
             .unwrap_or(Valor::Nulo),
         _ => return semantica(format!("função desconhecida: {nome}()")),
     })
+}
+
+/// ROUND de um real, como o SQLite: com 0 casas, `(x ± 0,5)` truncado; com mais, meio
+/// para longe do zero sobre a expansão decimal exata do número. Fora de ±2⁵² não há fração.
+fn arredondar_real(r: f64, casas: i64) -> f64 {
+    let casas = casas.clamp(0, 30) as usize;
+    if !r.is_finite() || r.abs() > 4_503_599_627_370_496.0 {
+        return r;
+    }
+    if casas == 0 {
+        return ((r + if r < 0.0 { -0.5 } else { 0.5 }) as i64) as f64;
+    }
+    // Expansão decimal exata (o Rust formata o valor binário exato com tantas casas).
+    let exato = format!("{:.80}", r.abs());
+    let (inteira, fracao) = exato.split_once('.').unwrap_or((&exato, ""));
+    let mut digitos: Vec<u8> = inteira
+        .bytes()
+        .chain(fracao.bytes().take(casas))
+        .map(|b| b - b'0')
+        .collect();
+    if fracao.as_bytes().get(casas).is_some_and(|&b| b >= b'5') {
+        // Soma 1 na última casa, com vai-um.
+        let mut i = digitos.len();
+        loop {
+            if i == 0 {
+                digitos.insert(0, 1);
+                break;
+            }
+            i -= 1;
+            if digitos[i] == 9 {
+                digitos[i] = 0;
+            } else {
+                digitos[i] += 1;
+                break;
+            }
+        }
+    }
+    let n = digitos.len() - casas;
+    let texto: String = digitos[..n]
+        .iter()
+        .map(|d| char::from(b'0' + d))
+        .chain(std::iter::once('.'))
+        .chain(digitos[n..].iter().map(|d| char::from(b'0' + d)))
+        .collect();
+    let v: f64 = texto.parse().unwrap_or(r.abs());
+    if r < 0.0 { -v } else { v }
+}
+
+/// ROUND exato de um decimal (meio para longe do zero).
+fn arredondar_decimal(d: Decimal, casas: i64) -> Decimal {
+    let casas = casas.clamp(0, 10) as u32;
+    let passo = 10i128.pow(10 - casas);
+    let b = d.bruto();
+    let resto = b % passo;
+    let base = b - resto;
+    let arredondado = if resto.abs() * 2 >= passo {
+        base + if b < 0 { -passo } else { passo }
+    } else {
+        base
+    };
+    Decimal::de_bruto(arredondado)
+}
+
+/// SUBSTR como o SQLite (início a partir de 1; negativo conta do fim; quantos negativo
+/// pega os anteriores), em caracteres.
+fn substr(t: &str, inicio: i64, quantos: Option<i64>) -> String {
+    let len = t.chars().count() as i64;
+    let mut p1 = inicio;
+    let (mut p2, neg) = match quantos {
+        Some(q) if q < 0 => (q.saturating_neg(), true),
+        Some(q) => (q, false),
+        None => (i64::MAX / 2, false),
+    };
+    if p1 < 0 {
+        p1 += len;
+        if p1 < 0 {
+            p2 += p1;
+            if p2 < 0 {
+                p2 = 0;
+            }
+            p1 = 0;
+        }
+    } else if p1 > 0 {
+        p1 -= 1;
+    } else if p2 > 0 {
+        p2 -= 1;
+    }
+    if neg {
+        p1 -= p2;
+        if p1 < 0 {
+            p2 += p1;
+            p1 = 0;
+        }
+    }
+    t.chars()
+        .skip(p1 as usize)
+        .take(p2.max(0) as usize)
+        .collect()
 }
 
 /// Junta em `molde` (sem repetir) os agregados que aparecem em `e`, conferindo o uso.
